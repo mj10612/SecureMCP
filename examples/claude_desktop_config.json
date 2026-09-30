@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "secure-mcp": {
+      "command": "uvx",
+      "args": ["secure-mcp", "serve"]
+    }
+  }
+}

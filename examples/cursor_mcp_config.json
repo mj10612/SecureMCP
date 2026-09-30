@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "secure-mcp": {
+      "command": "python",
+      "args": ["-m", "secure_mcp", "serve"]
+    }
+  }
+}
