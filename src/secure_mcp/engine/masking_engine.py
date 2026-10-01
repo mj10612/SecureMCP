@@ -42,6 +42,11 @@ class MaskingEngine:
         language: str = "auto",
     ) -> MaskResult:
         """Mask non-grammatical content words while strictly preserving grammatical syntax."""
+        strategy = generator.strategy
+        if mode == MaskMode.CODE_AWARE:
+            return self.mask_code(
+                text, session_id, generator, mapping_store, reverse_store, strategy
+            )
         custom_preserve = custom_preserve or set()
         chunks = self.tokenizer.tokenize(text)
 
@@ -94,7 +99,10 @@ class MaskingEngine:
 
             # English / Latin word processing
             is_sentence_start = (i == 0 or (i > 1 and chunks[i - 2].text in (".", "!", "?", "\n")))
-            token_type, should_mask = self.en_grammar.classify_token(word, is_sentence_start=is_sentence_start)
+            token_type, should_mask = self.en_grammar.classify_token(
+                word, is_sentence_start=is_sentence_start,
+                mask_sentence_initial_entities=(mode == MaskMode.ENTITIES_ONLY),
+            )
 
             if not should_mask or (mode == MaskMode.ENTITIES_ONLY and token_type not in (TokenType.ENTITY, TokenType.NUMBER)):
                 output_parts.append(word)
@@ -139,6 +147,7 @@ class MaskingEngine:
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
     ) -> MaskResult:
         """Mask code identifiers and string literals while keeping keywords, operators, and syntax."""
+        strategy = generator.strategy
         tokens = self.code_parser.tokenize(code)
         output_parts: List[str] = []
         total_tokens = 0
@@ -162,20 +171,28 @@ class MaskingEngine:
                 output_parts.append(surrogate)
                 masked_tokens += 1
             elif token_type == TokenType.LITERAL:
-                # Mask string content inside quotes
-                if raw_val.startswith(('"""', "'''", '"', "'")):
-                    quote_char = raw_val[:3] if raw_val.startswith(('"""', "'''")) else raw_val[0]
-                    content = raw_val[len(quote_char):-len(quote_char)] if len(raw_val) >= 2 * len(quote_char) else ""
-                    if content:
-                        surrogate = self._get_or_create_surrogate(
-                            content, TokenType.LITERAL, generator, mapping_store, reverse_store
-                        )
-                        output_parts.append(f"{quote_char}{surrogate}{quote_char}")
-                    else:
-                        output_parts.append(raw_val)
+                # Preserve delimiters/prefixes, but hide all literal content,
+                # including interpolated expressions and comment bodies.
+                if subkind == "comment":
+                    prefix = raw_val[:2] if raw_val.startswith(("//", "/*")) else "#"
+                    suffix = "*/" if prefix == "/*" else ""
+                else:
+                    match = re.match(r"[rRuUbBfF]*([\"']{3}|[\"'])", raw_val)
+                    if match is None:
+                        raise ValueError("Unsupported string literal")
+                    prefix = match.group()
+                    suffix = match.group(1)
+                end = len(raw_val) - len(suffix) if suffix else len(raw_val)
+                content = raw_val[len(prefix):end]
+                if content:
+                    surrogate = self._get_or_create_surrogate(
+                        content, TokenType.LITERAL, generator, mapping_store, reverse_store
+                    )
+                    output_parts.append(prefix + surrogate + suffix)
+                    masked_tokens += 1
                 else:
                     output_parts.append(raw_val)
-                masked_tokens += 1
+                    preserved_tokens += 1
             elif token_type == TokenType.NUMBER:
                 surrogate = self._get_or_create_surrogate(
                     raw_val, TokenType.NUMBER, generator, mapping_store, reverse_store
@@ -218,19 +235,25 @@ class MaskingEngine:
 
         # Sort surrogates longest first to prevent prefix substitution collisions
         sorted_surrogates = sorted(reverse_store.keys(), key=len, reverse=True)
-        restored_text = masked_text
         restored_count = 0
-
+        alternatives = []
         for surrogate in sorted_surrogates:
-            if surrogate in restored_text:
-                mapping = reverse_store[surrogate]
-                occurrences = restored_text.count(surrogate)
-                restored_text = restored_text.replace(surrogate, mapping.original)
-                restored_count += occurrences
+            escaped = re.escape(surrogate)
+            if surrogate[0].isalnum():
+                # ASCII boundaries allow Korean particles attached to a surrogate.
+                escaped = r"(?<![A-Za-z0-9_])" + escaped + r"(?![A-Za-z0-9_])"
+            alternatives.append(escaped)
+
+        def restore(match: re.Match) -> str:
+            nonlocal restored_count
+            restored_count += 1
+            return reverse_store[match.group()].original
+
+        restored_text = re.sub("|".join(alternatives), restore, masked_text)
 
         # Scan for any orphan surrogate tokens left in text
         pattern = StrategyGenerator.get_pattern(strategy)
-        remaining = pattern.findall(restored_text)
+        remaining = pattern.findall(masked_text)
         unmatched = [tok for tok in remaining if tok not in reverse_store]
 
         return UnmaskResult(
@@ -249,7 +272,7 @@ class MaskingEngine:
         reverse_store: Dict[str, TokenMapping],
     ) -> str:
         """Lookup existing surrogate or generate a deterministic new one."""
-        key = original_token.strip()
+        key = original_token
         if key in mapping_store:
             mapping = mapping_store[key]
             mapping.occurrence_count += 1

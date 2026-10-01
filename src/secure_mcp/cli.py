@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
 import click
 from rich.console import Console
 from rich.panel import Panel
@@ -12,6 +13,39 @@ from rich.table import Table
 
 from secure_mcp.server import app, engine, vault
 from secure_mcp.models import MaskMode, SurrogateStrategy
+from secure_mcp.encrypted_session import load_session, save_session
+from secure_mcp.session import PrivacySession
+
+
+class LiteralArgumentGroup(click.Group):
+    """Keep user text literal, including hash surrogates starting with '~'."""
+
+    def main(self, *args, **kwargs):
+        kwargs["windows_expand_args"] = False
+        return super().main(*args, **kwargs)
+
+
+def _session_file_options(command):
+    command = click.option(
+        "--session-file", type=click.Path(dir_okay=False, path_type=Path),
+        help="Opt in to a password-encrypted mapping file for separate CLI invocations.",
+    )(command)
+    return click.option(
+        "--session-password", envvar="SECURE_MCP_SESSION_PASSWORD", hide_input=True,
+        help="Encryption password (prefer the environment variable or hidden prompt).",
+    )(command)
+
+
+def _password(value):
+    return value or click.prompt("Session file password", hide_input=True)
+
+
+def _check_strategy(session, strategy):
+    if session.strategy != strategy:
+        raise click.ClickException(
+            f"Session uses strategy '{session.strategy.value}'; use a new session ID/file "
+            f"to switch to '{strategy.value}'."
+        )
 
 # Ensure UTF-8 output on Windows terminals
 if sys.platform == "win32":
@@ -24,7 +58,7 @@ if sys.platform == "win32":
 console = Console(legacy_windows=False)
 
 
-@click.group()
+@click.group(cls=LiteralArgumentGroup)
 @click.version_option(version="0.1.0")
 def main():
     """SecureMCP: Grammar-Preserving Zero-Knowledge Semantic Masking & Anonymization for LLMs."""
@@ -67,11 +101,25 @@ def serve(transport: str, host: str, port: int):
     help="Surrogate token strategy.",
 )
 @click.option("--language", default="auto", help="Language ('auto', 'en', 'ko').")
-def mask(text: str, session_id: str, mode: str, strategy: str, language: str):
+@_session_file_options
+def mask(text: str, session_id: str, mode: str, strategy: str, language: str,
+         session_file: Path | None, session_password: str | None):
     """Mask text using grammar-preserving token obfuscation."""
     strat = SurrogateStrategy(strategy)
     mask_mode = MaskMode(mode)
-    session = vault.get_or_create(session_id, mode=mask_mode, strategy=strat)
+    try:
+        if session_file is not None:
+            session_password = _password(session_password)
+            if session_file.exists():
+                session = load_session(session_file, session_password, session_id)
+                _check_strategy(session, strat)
+            else:
+                session = PrivacySession(session_id, mode=mask_mode, strategy=strat)
+        else:
+            session = vault.get_or_create(session_id, mode=mask_mode, strategy=strat)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    session.total_mask_calls += 1
 
     res = engine.mask_text(
         text=text,
@@ -83,6 +131,12 @@ def mask(text: str, session_id: str, mode: str, strategy: str, language: str):
         strategy=strat,
         language=language,
     )
+
+    if session_file is not None:
+        try:
+            save_session(session_file, session, session_password)
+        except (ValueError, OSError) as exc:
+            raise click.ClickException(str(exc)) from None
 
     console.print(Panel(text, title="[cyan]Original Input[/cyan]", border_style="blue"))
     console.print(Panel(res.masked_text, title="[green]Masked Output (Safe for LLM)[/green]", border_style="green"))
@@ -105,23 +159,42 @@ def mask(text: str, session_id: str, mode: str, strategy: str, language: str):
 @click.option(
     "--strategy",
     type=click.Choice(["bracket", "unicode", "pseudoword", "hash"]),
-    default="bracket",
+    default=None,
     help="Surrogate token strategy.",
 )
-def unmask(masked_text: str, session_id: str, strategy: str):
+@_session_file_options
+def unmask(masked_text: str, session_id: str, strategy: str | None,
+           session_file: Path | None, session_password: str | None):
     """Restore original tokens from an AI-generated response."""
-    session = vault.get_session(session_id)
+    try:
+        if session_file is not None:
+            session_password = _password(session_password)
+            session = load_session(session_file, session_password, session_id)
+        else:
+            session = vault.get_session(session_id)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
     if not session:
-        console.print(f"[bold red]Error: Session '{session_id}' not found.[/bold red]")
-        sys.exit(1)
+        raise click.ClickException(
+            f"Session '{session_id}' not found. For separate CLI invocations, "
+            "pass the same --session-file to both mask and unmask."
+        )
 
-    strat = SurrogateStrategy(strategy)
+    strat = SurrogateStrategy(strategy) if strategy is not None else session.strategy
+    _check_strategy(session, strat)
+    session.total_unmask_calls += 1
     res = engine.unmask(
         masked_text=masked_text,
         session_id=session.session_id,
         reverse_store=session.reverse_store,
         strategy=strat,
     )
+
+    if session_file is not None:
+        try:
+            save_session(session_file, session, session_password)
+        except (ValueError, OSError) as exc:
+            raise click.ClickException(str(exc)) from None
 
     console.print(Panel(masked_text, title="[yellow]Masked AI Output[/yellow]", border_style="yellow"))
     console.print(Panel(res.unmasked_text, title="[bold green]Restored Original Text[/bold green]", border_style="green"))

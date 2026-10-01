@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.models import MaskMode, SurrogateStrategy
 from secure_mcp.session import SessionVault
@@ -25,6 +26,13 @@ app = MCPServer(
 # Global engine and session vault
 engine = MaskingEngine()
 vault = SessionVault(default_ttl=3600)
+
+
+def _masking_session(session_id: str, mode: MaskMode, strategy: SurrogateStrategy):
+    try:
+        return vault.get_or_create(session_id, mode=mode, strategy=strategy)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
 
 
 @app.tool()
@@ -57,7 +65,7 @@ def mask_text(
     except ValueError:
         strat = SurrogateStrategy.BRACKET
 
-    session = vault.get_or_create(session_id, mode=mask_mode, strategy=strat)
+    session = _masking_session(session_id, mask_mode, strat)
     session.total_mask_calls += 1
 
     result = engine.mask_text(
@@ -77,14 +85,14 @@ def mask_text(
 def unmask_text(
     masked_text: str,
     session_id: str = "default_session",
-    strategy: str = "bracket",
+    strategy: Optional[str] = None,
 ) -> str:
     """Restore original tokens from an AI-generated response containing synthetic surrogates.
 
     Args:
         masked_text: The AI output containing synthetic surrogate tokens (e.g. [ENT_1], ⟦NOUN_2⟧).
         session_id: Session identifier matching the mask_text call.
-        strategy: The surrogate strategy that was used ('bracket', 'unicode', 'pseudoword', 'hash').
+        strategy: Optional strategy; defaults to the session's strategy.
 
     Returns:
         JSON string containing the restored unmasked text and token metrics.
@@ -98,9 +106,12 @@ def unmask_text(
         }, indent=2)
 
     try:
-        strat = SurrogateStrategy(strategy)
+        strat = SurrogateStrategy(strategy) if strategy is not None else session.strategy
     except ValueError:
         strat = session.strategy
+
+    if strat != session.strategy:
+        raise ToolError("Unmask strategy must match the session's strategy.")
 
     session.total_unmask_calls += 1
     result = engine.unmask(
@@ -133,7 +144,7 @@ def mask_code(
     except ValueError:
         strat = SurrogateStrategy.BRACKET
 
-    session = vault.get_or_create(session_id, mode=MaskMode.CODE_AWARE, strategy=strat)
+    session = _masking_session(session_id, MaskMode.CODE_AWARE, strat)
     session.total_mask_calls += 1
 
     result = engine.mask_code(
@@ -151,14 +162,14 @@ def mask_code(
 def unmask_code(
     masked_code: str,
     session_id: str = "default_session",
-    strategy: str = "bracket",
+    strategy: Optional[str] = None,
 ) -> str:
     """Restore original identifiers and string literals in code returned by the LLM.
 
     Args:
         masked_code: The obfuscated code returned by the AI.
         session_id: Session identifier matching the mask_code call.
-        strategy: The surrogate strategy used ('bracket', 'unicode', 'pseudoword', 'hash').
+        strategy: Optional strategy; defaults to the session's strategy.
 
     Returns:
         JSON string containing the restored code and restoration metrics.
@@ -172,9 +183,12 @@ def unmask_code(
         }, indent=2)
 
     try:
-        strat = SurrogateStrategy(strategy)
+        strat = SurrogateStrategy(strategy) if strategy is not None else session.strategy
     except ValueError:
         strat = session.strategy
+
+    if strat != session.strategy:
+        raise ToolError("Unmask strategy must match the session's strategy.")
 
     session.total_unmask_calls += 1
     result = engine.unmask(
@@ -215,7 +229,7 @@ def create_privacy_session(
     except ValueError:
         strat = SurrogateStrategy.BRACKET
 
-    session = vault.get_or_create(sid, mode=mask_mode, strategy=strat)
+    session = _masking_session(sid, mask_mode, strat)
     session.ttl_seconds = ttl_seconds
 
     return json.dumps({

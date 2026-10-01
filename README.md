@@ -158,6 +158,30 @@ In Cursor settings (`Features -> MCP Servers`), add:
 
 ## Interactive CLI Demo & Benchmark
 
+### Mask and restore in separate CLI processes
+
+MCP sessions remain in memory. To restore text in a separate CLI invocation,
+explicitly opt in to a password-encrypted local session file:
+
+```bash
+python -m secure_mcp mask "Alice from Google" --session-id example --session-file example.enc
+python -m secure_mcp unmask "[NOUN_1] from [ENT_1]" --session-id example --session-file example.enc
+```
+
+Both commands prompt for the same password without displaying it. For automation,
+set `SECURE_MCP_SESSION_PASSWORD` in the process environment. Files use authenticated
+Fernet encryption with a random salt and PBKDF2-HMAC-SHA256 (600,000 iterations);
+plaintext mappings are never written to disk. Delete the encrypted file after use.
+Files expire after one hour of inactivity, and loading an expired file is rejected.
+Use each file sequentially; concurrent CLI writers to the same file are unsupported.
+Without `--session-file`, CLI mappings exist only for the current process.
+
+A session's surrogate strategy is fixed when it is created. Reusing the same
+session with another strategy returns an error; use a new session ID/file instead.
+Unmasking infers the strategy from the session when `--strategy` is omitted.
+The `entities_only` mode conservatively masks capitalized non-function words,
+including sentence-initial words, so it may mask ordinary capitalized nouns too.
+
 Experience grammar-preserving obfuscation and local restoration in your terminal:
 
 ```bash

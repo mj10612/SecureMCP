@@ -95,6 +95,11 @@ class SessionVault:
             sid = session_id.strip() if (session_id and session_id.strip()) else self.default_session_id
             if sid in self._sessions:
                 sess = self._sessions[sid]
+                if sess.strategy != strategy:
+                    raise ValueError(
+                        f"Session '{sid}' uses strategy '{sess.strategy.value}'; "
+                        f"cannot switch to '{strategy.value}'. Use a new session ID."
+                    )
                 sess.touch()
                 return sess
 

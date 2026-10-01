@@ -70,9 +70,14 @@ class EnglishGrammarEngine:
         return clean in CLOSED_CLASS_WORDS
 
     @staticmethod
-    def classify_token(word: str, is_sentence_start: bool = False) -> Tuple[TokenType, bool]:
+    def classify_token(
+        word: str, is_sentence_start: bool = False,
+        mask_sentence_initial_entities: bool = False,
+    ) -> Tuple[TokenType, bool]:
         """Classify a token into TokenType and whether it should be masked."""
         clean = word.strip()
+        if clean.endswith("'s"):
+            clean = clean[:-2]
         lower = clean.lower()
 
         # Check sensitive patterns first
@@ -88,7 +93,7 @@ class EnglishGrammarEngine:
             return TokenType.GRAMMAR, False
 
         # Capitalized token not at sentence start is likely a Named Entity (proper noun)
-        if clean.istitle() and not is_sentence_start and len(clean) > 1:
+        if clean.istitle() and (not is_sentence_start or mask_sentence_initial_entities) and len(clean) > 1:
             return TokenType.ENTITY, True
 
         # All-caps token (e.g. acronyms, organizations)

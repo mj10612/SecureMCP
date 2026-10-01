@@ -12,8 +12,9 @@ TOKEN_SPLIT_REGEX = re.compile(
     r'|(?P<CODE_BLOCK>```[\s\S]*?```|`[^`\n]+`)'
     r'|(?P<URL>https?://[^\s<>"\'{}|\\^`]+)'
     r'|(?P<EMAIL>[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})'
+    r'|(?P<SECRET>\b(?:sk-|ak-|ghp_|gho_|xoxb-|xoxp-|sec_)[A-Za-z0-9_-]{12,}\b)'
     r'|(?P<NUMBER>[\$€£₩¥]?\d+(?:,\d{3})*(?:\.\d+)?%?)'
-    r'|(?P<HANGUL_WORD>[가-힣0-9A-Za-z_]+)'
+    r'|(?P<HANGUL_WORD>(?=[가-힣0-9A-Za-z_]*[가-힣])[가-힣0-9A-Za-z_]+)'
     r'|(?P<LATIN_WORD>[A-Za-z0-9_]+(?:\'[a-zA-Z]+)?)'
     r'|(?P<PUNCTUATION>[.,!?;:\"\'\(\)\[\]\{\}—–~`@#\$%\^&\*\+=\<\>/\\\|])'
     r'|(?P<OTHER>.)'
@@ -28,7 +29,7 @@ class TextChunk:
 
     @property
     def is_word(self) -> bool:
-        return self.kind in ("HANGUL_WORD", "LATIN_WORD", "EMAIL", "URL", "NUMBER")
+        return self.kind in ("HANGUL_WORD", "LATIN_WORD", "EMAIL", "URL", "SECRET", "NUMBER")
 
     @property
     def is_number(self) -> bool:

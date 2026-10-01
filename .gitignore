@@ -46,3 +46,4 @@ Thumbs.db
 # Project specific local storage
 *.local.db
 *.session.json
+*.enc
