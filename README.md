@@ -2,6 +2,12 @@
 
 Local English/Korean text masking and code review representations, with session-based restoration.
 
+Version 0.3 adds local Claude Code hooks without an API gateway. Install with `uv tool install .`,
+then run `secure-mcp init --agent claude` and `secure-mcp doctor`. This opt-in integration masks
+supported tool text and restores local execution/display values; direct prompts, attachments,
+telemetry and unknown output fields are not covered. See [local integration](docs/LOCAL_INTEGRATION.md)
+for installation, removal, the `exec` wrapper and exact failure behavior.
+
 ## English
 
 Mask confidential input **before** sending it to a provider. Restore responses in your trusted
@@ -119,6 +125,11 @@ preservation, and the MCP restoration boundary. Direct store readers should use 
 or `mapping_key`. Validate explicitly requested strategies; omitted strategies follow the generator.
 
 ## 한국어
+
+0.3에서는 게이트웨이 없이 사용하는 로컬 Claude Code Hook을 추가했습니다. `uv tool install .`
+설치 후 `secure-mcp init --agent claude`, `secure-mcp doctor`를 실행하세요. 지원하는 도구
+결과의 텍스트를 마스킹하고 실행 인자·화면 표시를 로컬에서 복원합니다. 직접 입력·자동 첨부·
+텔레메트리 등은 보호하지 않습니다. [설치·해제 및 보호 범위](docs/LOCAL_INTEGRATION.md)를 확인하세요.
 
 SecureMCP는 영어·한국어·혼합 문장을 로컬에서 마스킹하고 복원합니다. 클라우드에 요청하기
 **전에** `LocalPrivacyClient` 또는 로컬 API/CLI로 원문을 가리고, 응답은 로컬에서만 복원하세요.

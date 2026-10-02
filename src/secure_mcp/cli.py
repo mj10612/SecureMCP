@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+import json
+import subprocess
 import sys
 import time
 
@@ -16,6 +18,12 @@ from secure_mcp.encrypted_session import load_session, save_session, session_fil
 from secure_mcp.models import MaskMode, SurrogateStrategy
 from secure_mcp.server import app, engine, vault
 from secure_mcp.session import PrivacySession
+from secure_mcp.hooks import (
+    configure,
+    default_state_dir,
+    handle_hook,
+    installation_status,
+)
 
 if sys.platform == "win32":
     for stream in (sys.stdout, sys.stderr):
@@ -86,7 +94,7 @@ def _session(sid, path, password, mode=None, strategy=None):
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.2.0")
+@click.version_option(version="0.3.0")
 def main():
     """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 
@@ -99,6 +107,146 @@ def serve(transport):
         app.run(transport=transport)
     finally:
         vault.close()
+
+
+def _hook_options(command):
+    command = click.option("--agent", type=click.Choice(["claude"]), default="claude")(
+        command
+    )
+    command = click.option("--global", "global_scope", is_flag=True)(command)
+    return click.option(
+        "--state-dir", type=click.Path(path_type=Path), default=default_state_dir
+    )(command)
+
+
+def _hook_settings(global_scope):
+    return (
+        Path.home() / ".claude" / "settings.json"
+        if global_scope
+        else Path.cwd() / ".claude" / "settings.local.json"
+    )
+
+
+@main.command("init")
+@_hook_options
+def init_hooks(agent, global_scope, state_dir):
+    """Install local Claude tool hooks. Prompts/attachments are not intercepted."""
+    try:
+        backup = configure(_hook_settings(global_scope), state_dir, install=True)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(
+        "Claude tool hooks installed. Restart Claude Code; run secure-mcp doctor."
+    )
+    click.echo(
+        "Scope: tool text only. Direct prompts, attachments and telemetry are not covered."
+    )
+    if backup:
+        click.echo(f"Settings backup: {backup}")
+
+
+@main.command("uninstall")
+@_hook_options
+def uninstall_hooks(agent, global_scope, state_dir):
+    """Remove only SecureMCP hooks; preserve other settings and encrypted state."""
+    try:
+        configure(_hook_settings(global_scope), state_dir, install=False)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(
+        "SecureMCP hooks removed. Restart Claude Code. Encrypted state is retained."
+    )
+
+
+@main.command()
+@_hook_options
+def doctor(agent, global_scope, state_dir):
+    """Inspect hook registration. Host-version compatibility needs a real smoke test."""
+    try:
+        status = installation_status(_hook_settings(global_scope), state_dir)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(json.dumps(status, ensure_ascii=False))
+    if not status["ready"]:
+        raise click.ClickException("Incomplete hook installation.")
+
+
+@main.command()
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
+@click.option("--session-id", required=True)
+def stats(state_dir, session_id):
+    """Show local hook session counters, without original values or mappings."""
+    from secure_mcp.hooks import HookStore
+
+    try:
+        with HookStore(state_dir).session(session_id) as session:
+            click.echo(session.get_stats().model_dump_json() if session else "{}")
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@main.command(hidden=True)
+@click.option("--state-dir", type=click.Path(path_type=Path), required=True)
+def hook(state_dir):
+    """JSON stdin/stdout entry point invoked by Claude Code, never by an MCP model."""
+    payload = None
+    try:
+        if hasattr(sys.stdin, "reconfigure"):
+            sys.stdin.reconfigure(encoding="utf-8")
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a hook object.")
+        result = handle_hook(payload, state_dir)
+        click.echo(json.dumps(result, ensure_ascii=False))
+    except (ValueError, OSError, TypeError, AssertionError):
+        # Do not echo raw payloads or exception messages containing secret candidates.
+        if isinstance(payload, dict) and payload.get("hook_event_name") == "PreToolUse":
+            click.echo(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "SecureMCP restoration failed; check local state.",
+                        }
+                    }
+                )
+            )
+        else:
+            click.echo(
+                "SecureMCP hook failed; original host output may be used.", err=True
+            )
+            raise click.exceptions.Exit(1)
+
+
+@main.command("exec", context_settings={"ignore_unknown_options": True})
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
+@click.option("--session-id", required=True)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
+def exec_masked(state_dir, session_id, command):
+    """Run executable + arguments locally; return only masked stdout/stderr (no implicit shell)."""
+    from secure_mcp.hooks import HookStore
+
+    store = HookStore(state_dir)
+    try:
+        with store.session(session_id) as session:
+            restored = [store.restore(arg, session) for arg in command]
+        completed = subprocess.run(restored, capture_output=True, encoding="utf-8")
+        with store.session(session_id, create=True) as session:
+            assert session is not None
+            stdout = store.mask(completed.stdout, session)
+            stderr = store.mask(completed.stderr, session)
+    except (ValueError, OSError, AssertionError):
+        raise click.ClickException(
+            "Local execution/masking failed; no raw output was returned."
+        ) from None
+    click.echo(stdout, nl=False)
+    click.echo(stderr, nl=False, err=True)
+    raise click.exceptions.Exit(
+        completed.returncode
+        if completed.returncode >= 0
+        else 128 - completed.returncode
+    )
 
 
 @main.command()

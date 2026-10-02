@@ -51,3 +51,5 @@ Thumbs.db
 *.local.db
 *.session.json
 *.enc
+.claude/settings.local.json
+*.secure-mcp-*.bak

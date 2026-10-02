@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "secure-mcp"
-version = "0.2.0"
-description = "Local English/Korean masking and trusted-client restoration with MCP utilities"
+version = "0.3.0"
+description = "Local English/Korean masking, Claude Code hooks, and trusted restoration"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

@@ -1,5 +1,13 @@
 # Architecture and trust boundary
 
+Version 0.3 also offers an opt-in local Claude Code hook path. `hooks.py` owns settings merges,
+encrypted cross-process snapshots, schema-preserving tool text masking, local argument restoration,
+display-only restoration and session-end cleanup. `cli.py` exposes `init`, `doctor`, `uninstall`,
+`stats`, `exec` and the private JSON hook entry point. No provider endpoints or HTTP services are added.
+This is a partial tool-text boundary: the trusted callback architecture below still applies to
+full request protection. [Local integration](LOCAL_INTEGRATION.md) documents uncovered prompt,
+attachment, telemetry and host failure paths; registration is not a privacy guarantee.
+
 ```mermaid
 flowchart LR
     Raw[Trusted local host: raw input] --> Mask[LocalPrivacyClient / MaskingEngine]

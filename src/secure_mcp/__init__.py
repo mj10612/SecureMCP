@@ -1,6 +1,6 @@
 """Local English/Korean masking and trusted-client restoration with MCP utilities."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "SecureMCP Contributors"
 __license__ = "Apache-2.0"
 
