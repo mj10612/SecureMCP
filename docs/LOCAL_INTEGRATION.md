@@ -1,5 +1,9 @@
 # Local Claude Code & Codex integration / 로컬 에이전트 연동
 
+For automatic prompt/code protection and result restoration with existing subscription
+logins, use the [0.5 subscription gateway](GATEWAY.md). It registers no agent hooks.
+This page documents the optional legacy hook integration.
+
 SecureMCP 0.4 supports opt-in Claude Code and Codex command hooks without an API gateway, HTTP service,
 or provider endpoint changes. This is an experimental **tool-text integration**, not
 a guarantee that all confidential data stays off the network. The project name remains SecureMCP.

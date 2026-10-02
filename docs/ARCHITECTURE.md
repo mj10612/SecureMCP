@@ -1,11 +1,26 @@
 # Architecture and trust boundary
 
-Version 0.4 offers opt-in local Claude Code and Codex hook paths. `hooks.py` owns settings merges,
+Version 0.5 adds an authenticated loopback subscription gateway. `gateway.py` owns request
+masking, shared code/prompt allocations, strict JSON/SSE restoration, CLI OAuth forwarding
+and encrypted restart state. `gateway_install.py` owns reversible user settings changes and
+OS-login startup; it installs no agent hooks and does not load auth caches.
+[Gateway integration](GATEWAY.md) describes supported protocols and uncovered traffic.
+
+```mermaid
+flowchart LR
+    CLI[Claude Code / Codex: original input and local tools] --> Gateway[Authenticated loopback gateway]
+    Gateway -->|Masked request + CLI-owned OAuth| Subscription[Original subscription service]
+    Subscription -->|Alias response| Gateway
+    Gateway -->|Restored answer / local tool arguments| CLI
+    State[Encrypted local mappings] --- Gateway
+```
+
+Legacy opt-in local Claude Code and Codex hook paths remain available. `hooks.py` owns settings merges,
 encrypted cross-process snapshots, schema-preserving tool text masking, local argument restoration,
 Claude display-only restoration and session-end cleanup. Codex feedback replacement and local
 `Bash`/`apply_patch` input restoration use a separate adapter, with isolated encrypted state.
 `cli.py` exposes `init`, `doctor`, `uninstall`, `stats`, `exec`, local stdin `restore` and the
-private JSON hook entry point. No provider endpoints or HTTP services are added.
+private JSON hook entry point. The legacy hook path does not redirect provider endpoints.
 This is a partial tool-text boundary: the trusted callback architecture below still applies to
 full request protection. [Local integration](LOCAL_INTEGRATION.md) documents uncovered prompt,
 attachment, telemetry and host failure paths; registration is not a privacy guarantee.

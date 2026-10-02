@@ -2,11 +2,11 @@
 
 # 🛡️ SecureMCP
 
-**Local English/Korean Masking · Claude Code & Codex Hooks · Trusted Restoration**
+**Local English/Korean Masking · Subscription Gateway · Trusted Restoration**
 
 *영어·한국어·코드를 로컬에서 마스킹하고, 도구 실행과 사용자 화면에서 원문을 복원하는 개인정보 보호 도구*
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-brightgreen.svg)](pyproject.toml)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](.github/workflows/ci.yml)
 [![CI](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml)
@@ -25,12 +25,15 @@
 
 **SecureMCP** masks English/Korean text and code locally, with session-based restoration.
 
-Version 0.4 supports local Claude Code and Codex hooks without an API gateway. Install with
-`uv tool install .`, then run `secure-mcp init --agent claude` or `secure-mcp init --agent codex`.
-Check the selected agent with `secure-mcp doctor --agent <agent>`. This opt-in integration masks
-supported tool text and restores local execution/display values; direct prompts, attachments,
-telemetry and unknown output fields are not covered. See [local integration](docs/LOCAL_INTEGRATION.md)
-for installation, removal, the `exec` wrapper and exact failure behavior.
+Version 0.5 adds an experimental **local subscription gateway** for Claude Code and Codex.
+Run `secure-mcp gateway install` once, then use `claude` / `codex` normally. Requests are
+masked automatically; responses and local tool arguments are restored automatically. Existing
+CLI subscription OAuth is forwarded to the original subscription service; API keys are refused.
+No agent hooks are installed. See [subscription gateway](docs/GATEWAY.md) for setup,
+automatic startup, tested versions and the exact protection boundary.
+
+Legacy agent hooks remain optional utilities. They cover selected tool text rather than
+complete requests; [local integration](docs/LOCAL_INTEGRATION.md) documents their limits.
 
 Mask confidential input **before** sending it to a provider. Restore responses in your trusted
 local application and show them to the user there. Model-invoked MCP tool arguments are already
@@ -44,24 +47,39 @@ This is heuristic masking, not a proof of anonymity, cryptographic zero knowledg
 
 | Component | Supported versions / scope |
 | :--- | :--- |
-| SecureMCP | **0.4.0** |
+| SecureMCP | **0.5.0** |
 | Python | **3.10 · 3.11 · 3.12 · 3.13 · 3.14** in CI; package requires Python ≥ 3.10 |
 | Operating systems | **Windows · macOS · Linux** in CI |
-| Claude Code integration | Hosts supporting `updatedToolOutput` and `MessageDisplay`; validate your installed version before use |
-| Codex integration | **CLI 0.160.0** verified with an offline fixture provider; hooks must be enabled and trusted via `/hooks` |
+| Claude Code gateway | **2.1.287** native CLI verified with fake subscription OAuth and an offline provider |
+| Codex gateway | **CLI 0.160.0** native fixture tests and a live ChatGPT subscription request with automatic restoration verified |
 | MCP transport | Local **stdio**; CLI HTTP/SSE transports are disabled |
 | Natural languages | **English · 한국어 · mixed input** |
 | Code languages | Python · JavaScript · TypeScript · Go · Rust · Java · C · C++ · SQL |
 
 The [CI matrix](.github/workflows/ci.yml) covers 15 Python/OS combinations. Code-language
 support describes lexer modes, not compatibility with every language release or compiler.
-Agent hooks are experimental; a supported host API does not certify all-traffic privacy.
+The gateway is experimental. Native fixture tests verify routing/masking/restoration.
+Codex passed a live subscription smoke test; Claude live inference remains unverified because
+the signed-in account returned a usage-limit response. This does not certify all-traffic privacy.
 
 ---
 
 ## Quick Start
 
-### Local CLI and agent hooks
+### Automatic subscription integration
+
+```bash
+uv tool install .
+secure-mcp gateway install
+secure-mcp gateway status
+```
+
+Restart Claude Code/Codex and use their normal commands. Setup preserves login caches and
+registers a hidden user-login startup task. It changes user-wide provider settings; no agent
+hooks are added. Subscription limits still apply. This is text/code inference protection;
+images, remote attachments and unsupported payloads are blocked. See [gateway guide](docs/GATEWAY.md).
+
+### Legacy optional agent hooks
 
 ```bash
 uv tool install .
@@ -119,6 +137,7 @@ with LocalPrivacyClient() as client:
 | 🌐 English & Korean | Per-word multilingual handling, conservative Korean particle separation and explicit sensitive terms |
 | 🧩 Code-aware masking | Language-specific lexer modes for identifiers, literals, numbers and comments |
 | 🎭 Four surrogate strategies | Bracket, Unicode, delimited pseudoword and random hash representations |
+| 🔁 Subscription gateway | Automatic request masking, shared prompt/code aliases, local tool-argument restoration and automatic answer display; existing OAuth, no API-key fallback |
 | 🔌 Local agent hooks | Claude Code and Codex tool-text masking and local execution-argument restoration; Claude Code also supports display-only restoration |
 | 🔐 Session management | Stable per-session mappings, operation locks, idle expiry and opt-in encrypted snapshots |
 | 🛠️ CLI & Python API | Local masking/restoration, hook diagnostics, statistics and a buffered command wrapper |
@@ -189,7 +208,9 @@ flowchart LR
     Vault --- Restore
 ```
 
-The callback path masks input before the provider receives it. Agent hooks use a separate,
+The subscription gateway masks configured inference requests before forwarding them and
+restores responses before the CLI consumes them. The callback path masks its provider argument.
+Legacy agent hooks use a separate,
 partial tool-text path; they do not intercept all outgoing context. See the
 [architecture](docs/ARCHITECTURE.md) and [local integration](docs/LOCAL_INTEGRATION.md) documents.
 
@@ -257,13 +278,20 @@ or `mapping_key`. Validate explicitly requested strategies; omitted strategies f
 
 ## 한국어 안내 (Korean Overview)
 
-0.4에서는 게이트웨이 없이 사용하는 Claude Code·Codex 로컬 Hook을 지원합니다. `uv tool install .`
-설치 후 `secure-mcp init --agent claude` 또는 `secure-mcp init --agent codex`를 실행하고,
-`secure-mcp doctor --agent <agent>`로 확인하세요. Codex는 `/hooks`에서 등록한 Hook을 신뢰해야 합니다.
-Codex CLI 0.160.0은 외부 API 없이 실제 도구 실행·결과 마스킹·인자 복원을 검증했습니다. 지원하는 도구
-결과의 텍스트를 마스킹하고 실행 인자·화면 표시를 로컬에서 복원합니다. 직접 입력·자동 첨부·
-텔레메트리 등은 보호하지 않습니다. Codex의 화면 자동 복원은 지원하지 않으며, 별도 `restore`
-명령으로 로컬에서 복원할 수 있습니다. [설치·해제 및 보호 범위](docs/LOCAL_INTEGRATION.md)를 확인하세요.
+0.5에서는 **Claude Code·Codex의 기존 구독 로그인을 유지하는 로컬 게이트웨이**를 제공합니다.
+`uv tool install .` 설치 후 `secure-mcp gateway install`을 **한 번** 실행하고 두 CLI를 재시작하세요.
+그 뒤에는 평소처럼 `claude` / `codex`를 사용하면 됩니다. 직접 입력·텍스트 코드·도구 결과를 자동으로
+마스킹하고, 답변과 로컬 실행 인자는 자동 복원합니다. 함수명·변수명·문자열·숫자·주석을 보존하는
+예외는 추가하지 않았습니다. 입력에서 지칭한 함수와 코드의 함수는 같은 치환표를 사용합니다.
+
+기존 로그인 파일은 읽거나 복사하지 않습니다. CLI가 관리하는 OAuth 헤더와 갱신 흐름을 사용하고,
+API 키 요청은 거부하므로 유료 API로 자동 전환하지 않습니다. 새 Hook을 등록하지 않으며,
+운영체제 사용자 로그인 시 백그라운드로 자동 시작하도록 설정합니다. 기존 Hook 방식은 선택 기능으로
+남겨 두었습니다. [설치·해제 및 보호 범위](docs/GATEWAY.md)를 확인하세요.
+
+Claude Code 2.1.287·Codex 0.160.0의 실제 CLI를 모의 OAuth/로컬 서버로 검증했습니다.
+Codex는 실제 구독 요청·자동 복원까지 확인했습니다. Claude는 계정 사용량 제한으로 실제 응답 검증을 완료하지 못했습니다. 이미지·원격 첨부·미지원 요청은 차단하고,
+게이트웨이 밖의 도구 네트워크·텔레메트리까지 보호한다고 주장하지 않습니다.
 
 SecureMCP는 영어·한국어·혼합 문장을 로컬에서 마스킹하고 복원합니다. 클라우드에 요청하기
 **전에** `LocalPrivacyClient` 또는 로컬 API/CLI로 원문을 가리고, 응답은 로컬에서만 복원하세요.
@@ -300,7 +328,8 @@ python -m pytest -W error --cov=secure_mcp --cov-report=term-missing --cov-fail-
 
 ## Documentation
 
-- [Local Claude Code & Codex Integration / 로컬 연동 안내](docs/LOCAL_INTEGRATION.md)
+- [Subscription Gateway / 구독 로그인 자동 연동](docs/GATEWAY.md)
+- [Legacy Local Claude Code & Codex Integration / 기존 Hook 안내](docs/LOCAL_INTEGRATION.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Issue Resolution and Review Notes](docs/ISSUE_RESOLUTION.md)
 - [Contributing Guidelines](CONTRIBUTING.md)

@@ -96,7 +96,7 @@ def _session(sid, path, password, mode=None, strategy=None):
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.4.0")
+@click.version_option(version="0.5.0")
 def main():
     """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 
@@ -489,6 +489,110 @@ def benchmark():
         )
     finally:
         vault.clear_session(session.session_id)
+
+
+@main.group()
+def gateway():
+    """Automatic masking/restoration using existing CLI subscription logins."""
+
+
+@gateway.command("install")
+@click.option("--agent", type=click.Choice(["claude", "codex", "both"]), default="both")
+@click.option("--config", type=click.Path(path_type=Path))
+@click.option("--port", type=click.IntRange(1024, 65535), default=38117)
+def gateway_install(agent, config, port):
+    """One-time user-wide setup. Keeps auth caches; installs automatic startup."""
+    from secure_mcp.gateway_install import (
+        default_config,
+        ensure_gateway,
+        install_gateway,
+    )
+
+    path = config or default_config()
+    try:
+        changed = install_gateway(path, agent, port)
+        ensure_gateway(path)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(
+        "Subscription gateway configured with user-login auto-start. Restart your CLI; no agent hooks were installed."
+    )
+    for file in changed:
+        click.echo(str(file))
+
+
+@gateway.command("ensure", hidden=True)
+@click.option("--config", type=click.Path(path_type=Path), required=True)
+def gateway_ensure(config):
+    from secure_mcp.gateway_install import ensure_gateway
+
+    try:
+        ensure_gateway(config)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@gateway.command("run")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_run(config):
+    """Run the subscription gateway in the foreground (normally auto-started)."""
+    from secure_mcp.gateway import PrivacyGateway
+    from secure_mcp.gateway_install import default_config, load_config
+
+    try:
+        settings = load_config(config or default_config())
+        state = (config or default_config()).resolve().parent / "sessions"
+        with PrivacyGateway(
+            ("127.0.0.1", settings["port"]), settings["token"], state_dir=state
+        ) as server:
+            server.serve_forever()
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@gateway.command("uninstall")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_uninstall(config):
+    """Restore backed-up settings; refuses to overwrite subsequent user edits."""
+    from secure_mcp.gateway_install import default_config, uninstall_gateway
+
+    try:
+        uninstall_gateway(config or default_config())
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("Previous agent settings restored. Restart the CLI.")
+
+
+@gateway.command("status")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_status(config):
+    """Check the authenticated local gateway without contacting a provider."""
+    from secure_mcp.gateway_install import default_config, healthy, load_config
+
+    try:
+        ready = healthy(load_config(config or default_config()))
+    except (ValueError, OSError):
+        ready = False
+    click.echo(
+        "Subscription gateway ready"
+        if ready
+        else "Subscription gateway stopped or unconfigured"
+    )
+    if not ready:
+        raise click.exceptions.Exit(1)
+
+
+@gateway.command("stop")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_stop(config):
+    """Stop the local daemon and release mappings; login startup can restart it."""
+    from secure_mcp.gateway_install import default_config, stop_gateway
+
+    try:
+        stop_gateway(config or default_config())
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("Gateway stopped.")
 
 
 if __name__ == "__main__":
