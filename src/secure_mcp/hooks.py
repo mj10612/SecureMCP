@@ -1,4 +1,4 @@
-"""Local Claude Code hooks. These protect tool text, not all provider traffic."""
+"""Local Claude Code and Codex hooks: partial tool-text protection."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ from secure_mcp.session import PrivacySession
 
 
 EVENTS = ("PreToolUse", "PostToolUse", "MessageDisplay", "SessionEnd")
+AGENT_EVENTS = {
+    "claude": EVENTS,
+    "codex": ("PreToolUse", "PostToolUse", "SessionEnd"),
+}
 MARKER = "-m secure_mcp hook --state-dir"
 # Preserve protocol discriminators, IDs, binary data and JSON scalar types.
 TEXT_FIELDS = frozenset(
@@ -63,6 +67,11 @@ def default_state_dir() -> Path:
     return Path.home() / ".secure-mcp" / "hooks"
 
 
+def agent_state_dir(directory: Path, agent: str) -> Path:
+    """Keep existing Claude snapshots in place; isolate new Codex sessions."""
+    return directory / "codex" if agent == "codex" else directory
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".secure-mcp-", dir=path.parent)
     try:
@@ -80,7 +89,7 @@ def _atomic_json(path: Path, value: Any) -> None:
 def _settings(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if not isinstance(value, dict) or not isinstance(value.get("hooks", {}), dict):
-        raise ValueError("Invalid Claude settings; no settings were overwritten.")
+        raise ValueError("Invalid agent settings; no settings were overwritten.")
     for entries in value.get("hooks", {}).values():
         if not isinstance(entries, list):
             raise ValueError("Invalid hook registry; no settings were overwritten.")
@@ -92,7 +101,7 @@ def _settings(path: Path) -> dict[str, Any]:
     return value
 
 
-def _owned(hook: dict[str, Any]) -> bool:
+def _owned(hook: dict[str, Any], agent: str | None = None) -> bool:
     command = hook.get("command")
     if (
         hook.get("type") != "command"
@@ -104,15 +113,20 @@ def _owned(hook: dict[str, Any]) -> bool:
         parts = shlex.split(command, posix=os.name != "nt")
     except ValueError:
         return False
-    return len(parts) == 6 and parts[1:5] == ["-m", "secure_mcp", "hook", "--state-dir"]
+    if parts[1:5] != ["-m", "secure_mcp", "hook", "--state-dir"]:
+        return False
+    owner = "claude" if len(parts) == 6 else None
+    if len(parts) == 8 and parts[6] == "--agent" and parts[7] in AGENT_EVENTS:
+        owner = parts[7]
+    return owner is not None and (agent is None or owner == agent)
 
 
-def _remove_owned(config: dict[str, Any]) -> None:
+def _remove_owned(config: dict[str, Any], agent: str) -> None:
     registry = config.get("hooks", {})
     for event in list(registry):
         remaining = []
         for entry in registry[event]:
-            kept = [h for h in entry["hooks"] if not _owned(h)]
+            kept = [h for h in entry["hooks"] if not _owned(h, agent)]
             if kept:
                 remaining.append({**entry, "hooks": kept})
         if remaining:
@@ -121,12 +135,16 @@ def _remove_owned(config: dict[str, Any]) -> None:
             del registry[event]
 
 
-def configure(settings: Path, state_dir: Path, install: bool) -> Path | None:
+def configure(
+    settings: Path, state_dir: Path, install: bool, agent: str = "claude"
+) -> Path | None:
     """Merge only our hooks; back up exact previous bytes and preserve other settings."""
+    if agent not in AGENT_EVENTS:
+        raise ValueError("Unsupported agent.")
     settings.parent.mkdir(parents=True, exist_ok=True)
     with session_file_lock(settings):
         config = _settings(settings)
-        _remove_owned(config)
+        _remove_owned(config, agent)
         if install:
             state_dir = state_dir.resolve()
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -143,13 +161,25 @@ def configure(settings: Path, state_dir: Path, install: bool) -> Path | None:
                 "--state-dir",
                 str(state_dir),
             ]
+            if agent != "claude":
+                args.extend(["--agent", agent])
             command = (
                 subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
             )
             registry = config.setdefault("hooks", {})
-            for event in EVENTS:
+            for event in AGENT_EVENTS[agent]:
                 registry.setdefault(event, []).append(
-                    {"hooks": [{"type": "command", "command": command, "timeout": 10}]}
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": command,
+                                "timeout": 3
+                                if agent == "codex" and event == "SessionEnd"
+                                else 10,
+                            }
+                        ]
+                    }
                 )
         backup = None
         if settings.exists():
@@ -163,14 +193,18 @@ def configure(settings: Path, state_dir: Path, install: bool) -> Path | None:
         return backup
 
 
-def installation_status(settings: Path, state_dir: Path) -> dict[str, Any]:
+def installation_status(
+    settings: Path, state_dir: Path, agent: str = "claude"
+) -> dict[str, Any]:
+    if agent not in AGENT_EVENTS:
+        raise ValueError("Unsupported agent.")
     config = _settings(settings)
     registry = config.get("hooks", {})
     installed = [
         event
-        for event in EVENTS
+        for event in AGENT_EVENTS[agent]
         if any(
-            _working_registration(h, state_dir)
+            _working_registration(h, state_dir, agent)
             for entry in registry.get(event, [])
             for h in entry["hooks"]
         )
@@ -178,18 +212,24 @@ def installation_status(settings: Path, state_dir: Path) -> dict[str, Any]:
     return {
         "installed_events": installed,
         "key_present": (state_dir / "key").is_file(),
-        "ready": len(installed) == len(EVENTS) and (state_dir / "key").is_file(),
+        "ready": len(installed) == len(AGENT_EVENTS[agent])
+        and (state_dir / "key").is_file(),
         "scope": "tool text only; prompts, attachments and telemetry are not covered",
+        "agent": agent,
+        "display_restoration": agent == "claude",
+        "host_trust": "Review installed hooks using /hooks"
+        if agent == "codex"
+        else "Check host trust settings",
     }
 
 
-def _working_registration(hook: dict[str, Any], state_dir: Path) -> bool:
-    if not _owned(hook):
+def _working_registration(hook: dict[str, Any], state_dir: Path, agent: str) -> bool:
+    if not _owned(hook, agent):
         return False
     parts = shlex.split(hook["command"], posix=os.name != "nt")
     return (
         Path(parts[0].strip('"')).is_file()
-        and Path(parts[-1].strip('"')).resolve() == state_dir.resolve()
+        and Path(parts[5].strip('"')).resolve() == state_dir.resolve()
     )
 
 
@@ -297,9 +337,11 @@ def _walk(
     return value
 
 
-def handle_hook(payload: dict[str, Any], state_dir: Path) -> dict[str, Any]:
+def handle_hook(
+    payload: dict[str, Any], state_dir: Path, agent: str = "claude"
+) -> dict[str, Any]:
     event = payload.get("hook_event_name")
-    if event not in EVENTS:
+    if agent not in AGENT_EVENTS or event not in AGENT_EVENTS[agent]:
         raise ValueError("Unsupported hook event.")
     sid = payload.get("session_id")
     if not isinstance(sid, str):
@@ -320,6 +362,18 @@ def handle_hook(payload: dict[str, Any], state_dir: Path) -> dict[str, Any]:
                 isinstance(payload["tool_response"], (str, list)),
                 preserve_protocol=True,
             )
+        if agent == "codex":
+            # Codex does not support Claude's updatedToolOutput. Feedback replacement
+            # also reaches code-mode tool calls without rejecting the nested promise.
+            text = (
+                replacement
+                if isinstance(replacement, str)
+                else json.dumps(replacement, ensure_ascii=False)
+            )
+            return {
+                "continue": False,
+                "stopReason": text or "SecureMCP: empty tool output.",
+            }
         return {
             "hookSpecificOutput": {
                 "hookEventName": event,
@@ -330,7 +384,8 @@ def handle_hook(payload: dict[str, Any], state_dir: Path) -> dict[str, Any]:
         if event == "PreToolUse":
             if not isinstance(payload.get("tool_input"), dict):
                 raise ValueError("Missing tool input object.")
-            if payload.get("tool_name") not in LOCAL_TOOLS:
+            local_tools = {"Bash", "apply_patch"} if agent == "codex" else LOCAL_TOOLS
+            if payload.get("tool_name") not in local_tools:
                 # Never restore originals into remote MCP/network tools.
                 if StrategyGenerator.get_pattern(SurrogateStrategy.UNICODE).search(
                     json.dumps(payload["tool_input"], ensure_ascii=False)
@@ -342,6 +397,18 @@ def handle_hook(payload: dict[str, Any], state_dir: Path) -> dict[str, Any]:
             )
             if restored == payload["tool_input"]:
                 return {}
+            if agent == "codex":
+                if not isinstance(restored.get("command"), str):
+                    raise ValueError("Codex local tool requires a command string.")
+                # Codex requires allow alongside updatedInput. This is PreToolUse,
+                # not a PermissionRequest approval; sandbox/approval policy is retained.
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "permissionDecision": "allow",
+                        "updatedInput": restored,
+                    }
+                }
             # Never grant permission: the host must run its normal approval checks.
             return {
                 "hookSpecificOutput": {"hookEventName": event, "updatedInput": restored}

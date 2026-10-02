@@ -1,10 +1,12 @@
-# Local Claude Code integration / 로컬 Claude Code 연동
+# Local Claude Code & Codex integration / 로컬 에이전트 연동
 
-SecureMCP 0.3 adds opt-in, local command hooks without an API gateway, HTTP service,
+SecureMCP 0.4 supports opt-in Claude Code and Codex command hooks without an API gateway, HTTP service,
 or provider endpoint changes. This is an experimental **tool-text integration**, not
 a guarantee that all confidential data stays off the network. The project name remains SecureMCP.
 
 ## Install and remove
+
+The Claude Code instructions follow. For Codex, see [Codex](#codex).
 
 Install the package in an environment that will remain available to Claude Code:
 
@@ -38,6 +40,73 @@ presence; it does **not** certify host-version compatibility or inspect actual p
 Claude Code must support `updatedToolOutput` and `MessageDisplay`. Check the
 [current official hook reference](https://code.claude.com/docs/en/hooks), then test the
 installed host with a disposable, nonsensitive fixture before relying on the integration.
+
+## Codex
+
+```powershell
+secure-mcp init --agent codex
+secure-mcp doctor --agent codex
+secure-mcp uninstall --agent codex
+```
+
+The default project file is `.codex/hooks.json`. Use `--global` on each command to select
+`$CODEX_HOME/hooks.json`, or `~/.codex/hooks.json` when `CODEX_HOME` is unset. SecureMCP
+does not edit `config.toml`, enable disabled features, change approval/sandbox settings, or
+mark hooks trusted. Restart Codex, trust the project if using project hooks, and review/trust
+the exact hook definitions through `/hooks`. Changed definitions can require renewed trust.
+`doctor` reports installation/key readiness, not effective hook trust or enabled feature flags.
+
+Codex has three registered hooks:
+
+| Event | SecureMCP behavior |
+| :--- | :--- |
+| `PostToolUse` | Mask supported tool text and return feedback replacing the original tool result |
+| `PreToolUse` | Restore string argument values for `Bash` and `apply_patch`; refuse unknown surrogates |
+| `SessionEnd` | Delete the encrypted conversation snapshot |
+
+Codex uses a different output protocol from Claude Code. The adapter returns `continue: false`
+with masked `stopReason` text for post-tool feedback rather than `updatedToolOutput`. Structured
+results become JSON text in that feedback. Codex requires `permissionDecision: "allow"` alongside
+restored `updatedInput`; this is a pre-tool rewrite, not a `PermissionRequest` approval. No
+PermissionRequest handler is installed. Bash and patch rewrites retain a string `command` field.
+Other tools do not receive restored originals. Feedback replacement also works for code-mode
+tool calls without intentionally rejecting their nested promises.
+
+There is no Codex display-only restoration hook in the currently documented interface. Responses
+remain surrogate text. For local display before the session ends, feed UTF-8 text into:
+
+```powershell
+secure-mcp restore --agent codex --session-id <codex-session-id>
+secure-mcp stats --agent codex --session-id <codex-session-id>
+secure-mcp exec --agent codex --session-id <codex-session-id> -- git status
+```
+
+`restore` reads text from stdin until EOF and writes restored text to stdout. Never invoke it as
+a model-visible shell tool: restored stdout would reintroduce originals into model context.
+The manual `exec` wrapper still buffers output and is not installed as a command rewrite.
+Codex state is stored in `<state-dir>/codex`, isolating it from existing Claude snapshots even
+when conversation IDs match. Custom `--state-dir` takes the base directory, not this subdirectory.
+
+Codex CLI **0.160.0** was exercised against a deterministic local fixture provider: a shell read
+produced masked model-visible feedback, a following shell write restored the value locally,
+and captured provider requests contained no original fixture email. No external model or paid
+API was used. Reproduce this optional host test with a native binary:
+
+```powershell
+$env:SECURE_MCP_CODEX_BINARY = "C:\path\to\codex.exe"
+python -m pytest tests/test_codex_host.py -q
+```
+
+Without that environment variable, ordinary CI skips the real-host test and runs the adapter
+regressions. The fixture test bypasses hook trust only for its newly generated, locally vetted
+definitions in an isolated temporary Codex home; normal installation never bypasses trust.
+
+Codex hook errors we can catch suppress a post-tool result with sanitized feedback; unknown or
+missing mappings deny a pre-tool restoration. Host timeouts, skipped/untrusted/disabled hooks,
+specialized tool paths, other concurrent hooks, hosted web search, direct prompts, attachments,
+and telemetry remain outside the boundary. Nonzero-exit Bash results can reach Codex PostToolUse;
+that differs from the successful-result Claude path below. Consult the
+[official OpenAI hook reference](https://learn.chatgpt.com/docs/hooks) for host behavior and coverage.
 
 ## Data flow and scope
 
@@ -123,6 +192,17 @@ a malicious agent permitted to read these files, or a compromised machine. Backu
 same local trust requirement. No physical memory-zeroization guarantee is made.
 
 ## 한국어 사용 안내
+
+Codex는 `secure-mcp init --agent codex`로 등록하고, `secure-mcp doctor --agent codex`로
+확인합니다. 프로젝트의 `.codex/hooks.json`에 설치하며 `--global`은 `CODEX_HOME` 또는
+`~/.codex`를 사용합니다. Codex를 재시작한 뒤 `/hooks`에서 정확한 Hook 정의를 검토하고
+신뢰해야 합니다. 자동으로 신뢰하거나 보안 설정을 바꾸지는 않습니다.
+
+Codex는 도구 결과를 마스킹한 피드백으로 교체하고 `Bash`·`apply_patch` 실행 인자를 복원합니다.
+화면 자동 복원은 제공하지 않습니다. 대화가 끝나기 전에 `secure-mcp restore --agent codex
+--session-id <ID>`에 마스킹된 텍스트를 UTF-8 표준입력으로 전달하면 로컬에서 복원할 수 있습니다.
+이 복원 명령을 모델이 보는 도구로 실행하면 안 됩니다. Codex 상태는 별도 `codex` 하위 폴더에
+저장합니다. CLI 0.160.0에서 로컬 가상 제공자를 사용하여 실제 실행과 재전송 데이터까지 검증했습니다.
 
 이름은 SecureMCP로 유지합니다. 로컬에 설치한 뒤 `secure-mcp init --agent claude`를
 실행하면 프로젝트의 Claude Code Hook을 등록합니다. API 주소 변경이나 게이트웨이 서버는

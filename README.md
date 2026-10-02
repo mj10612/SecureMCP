@@ -2,11 +2,11 @@
 
 # 🛡️ SecureMCP
 
-**Local English/Korean Masking · Claude Code Hooks · Trusted Restoration**
+**Local English/Korean Masking · Claude Code & Codex Hooks · Trusted Restoration**
 
 *영어·한국어·코드를 로컬에서 마스킹하고, 도구 실행과 사용자 화면에서 원문을 복원하는 개인정보 보호 도구*
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-brightgreen.svg)](pyproject.toml)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](.github/workflows/ci.yml)
 [![CI](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml)
@@ -25,8 +25,9 @@
 
 **SecureMCP** masks English/Korean text and code locally, with session-based restoration.
 
-Version 0.3 adds local Claude Code hooks without an API gateway. Install with `uv tool install .`,
-then run `secure-mcp init --agent claude` and `secure-mcp doctor`. This opt-in integration masks
+Version 0.4 supports local Claude Code and Codex hooks without an API gateway. Install with
+`uv tool install .`, then run `secure-mcp init --agent claude` or `secure-mcp init --agent codex`.
+Check the selected agent with `secure-mcp doctor --agent <agent>`. This opt-in integration masks
 supported tool text and restores local execution/display values; direct prompts, attachments,
 telemetry and unknown output fields are not covered. See [local integration](docs/LOCAL_INTEGRATION.md)
 for installation, removal, the `exec` wrapper and exact failure behavior.
@@ -43,23 +44,24 @@ This is heuristic masking, not a proof of anonymity, cryptographic zero knowledg
 
 | Component | Supported versions / scope |
 | :--- | :--- |
-| SecureMCP | **0.3.0** |
+| SecureMCP | **0.4.0** |
 | Python | **3.10 · 3.11 · 3.12 · 3.13 · 3.14** in CI; package requires Python ≥ 3.10 |
 | Operating systems | **Windows · macOS · Linux** in CI |
 | Claude Code integration | Hosts supporting `updatedToolOutput` and `MessageDisplay`; validate your installed version before use |
+| Codex integration | **CLI 0.160.0** verified with an offline fixture provider; hooks must be enabled and trusted via `/hooks` |
 | MCP transport | Local **stdio**; CLI HTTP/SSE transports are disabled |
 | Natural languages | **English · 한국어 · mixed input** |
 | Code languages | Python · JavaScript · TypeScript · Go · Rust · Java · C · C++ · SQL |
 
 The [CI matrix](.github/workflows/ci.yml) covers 15 Python/OS combinations. Code-language
 support describes lexer modes, not compatibility with every language release or compiler.
-Claude Code hooks are experimental; a supported host API does not certify all-traffic privacy.
+Agent hooks are experimental; a supported host API does not certify all-traffic privacy.
 
 ---
 
 ## Quick Start
 
-### Local CLI and Claude Code hooks
+### Local CLI and agent hooks
 
 ```bash
 uv tool install .
@@ -70,6 +72,18 @@ secure-mcp doctor
 Restart Claude Code after installation. Hooks default to the current project; use `--global`
 for user-wide registration. See [local integration](docs/LOCAL_INTEGRATION.md) for supported
 tool fields, installation/removal and limitations.
+
+For Codex:
+
+```bash
+secure-mcp init --agent codex
+secure-mcp doctor --agent codex
+```
+
+Restart Codex and review/trust the installed definitions in `/hooks`. Project hooks require a
+trusted project. Codex masks tool results and restores `Bash`/`apply_patch` inputs; automatic
+screen restoration is unavailable. Use `secure-mcp restore --agent codex --session-id <id>`
+with masked text on UTF-8 stdin for local display. See [Codex integration](docs/LOCAL_INTEGRATION.md#codex).
 
 ### Development installation and demo
 
@@ -105,7 +119,7 @@ with LocalPrivacyClient() as client:
 | 🌐 English & Korean | Per-word multilingual handling, conservative Korean particle separation and explicit sensitive terms |
 | 🧩 Code-aware masking | Language-specific lexer modes for identifiers, literals, numbers and comments |
 | 🎭 Four surrogate strategies | Bracket, Unicode, delimited pseudoword and random hash representations |
-| 🔌 Local Claude Code hooks | Tool-text masking, local execution-argument restoration and display-only restoration |
+| 🔌 Local agent hooks | Claude Code and Codex tool-text masking and local execution-argument restoration; Claude Code also supports display-only restoration |
 | 🔐 Session management | Stable per-session mappings, operation locks, idle expiry and opt-in encrypted snapshots |
 | 🛠️ CLI & Python API | Local masking/restoration, hook diagnostics, statistics and a buffered command wrapper |
 
@@ -175,7 +189,7 @@ flowchart LR
     Vault --- Restore
 ```
 
-The callback path masks input before the provider receives it. Claude Code hooks use a separate,
+The callback path masks input before the provider receives it. Agent hooks use a separate,
 partial tool-text path; they do not intercept all outgoing context. See the
 [architecture](docs/ARCHITECTURE.md) and [local integration](docs/LOCAL_INTEGRATION.md) documents.
 
@@ -243,10 +257,13 @@ or `mapping_key`. Validate explicitly requested strategies; omitted strategies f
 
 ## 한국어 안내 (Korean Overview)
 
-0.3에서는 게이트웨이 없이 사용하는 로컬 Claude Code Hook을 추가했습니다. `uv tool install .`
-설치 후 `secure-mcp init --agent claude`, `secure-mcp doctor`를 실행하세요. 지원하는 도구
+0.4에서는 게이트웨이 없이 사용하는 Claude Code·Codex 로컬 Hook을 지원합니다. `uv tool install .`
+설치 후 `secure-mcp init --agent claude` 또는 `secure-mcp init --agent codex`를 실행하고,
+`secure-mcp doctor --agent <agent>`로 확인하세요. Codex는 `/hooks`에서 등록한 Hook을 신뢰해야 합니다.
+Codex CLI 0.160.0은 외부 API 없이 실제 도구 실행·결과 마스킹·인자 복원을 검증했습니다. 지원하는 도구
 결과의 텍스트를 마스킹하고 실행 인자·화면 표시를 로컬에서 복원합니다. 직접 입력·자동 첨부·
-텔레메트리 등은 보호하지 않습니다. [설치·해제 및 보호 범위](docs/LOCAL_INTEGRATION.md)를 확인하세요.
+텔레메트리 등은 보호하지 않습니다. Codex의 화면 자동 복원은 지원하지 않으며, 별도 `restore`
+명령으로 로컬에서 복원할 수 있습니다. [설치·해제 및 보호 범위](docs/LOCAL_INTEGRATION.md)를 확인하세요.
 
 SecureMCP는 영어·한국어·혼합 문장을 로컬에서 마스킹하고 복원합니다. 클라우드에 요청하기
 **전에** `LocalPrivacyClient` 또는 로컬 API/CLI로 원문을 가리고, 응답은 로컬에서만 복원하세요.
@@ -283,7 +300,7 @@ python -m pytest -W error --cov=secure_mcp --cov-report=term-missing --cov-fail-
 
 ## Documentation
 
-- [Local Claude Code Integration / 로컬 연동 안내](docs/LOCAL_INTEGRATION.md)
+- [Local Claude Code & Codex Integration / 로컬 연동 안내](docs/LOCAL_INTEGRATION.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Issue Resolution and Review Notes](docs/ISSUE_RESOLUTION.md)
 - [Contributing Guidelines](CONTRIBUTING.md)

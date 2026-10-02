@@ -52,4 +52,5 @@ Thumbs.db
 *.session.json
 *.enc
 .claude/settings.local.json
+.codex/hooks.json
 *.secure-mcp-*.bak

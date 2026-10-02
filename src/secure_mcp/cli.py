@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ from secure_mcp.models import MaskMode, SurrogateStrategy
 from secure_mcp.server import app, engine, vault
 from secure_mcp.session import PrivacySession
 from secure_mcp.hooks import (
+    agent_state_dir,
     configure,
     default_state_dir,
     handle_hook,
@@ -94,7 +96,7 @@ def _session(sid, path, password, mode=None, strategy=None):
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.3.0")
+@click.version_option(version="0.4.0")
 def main():
     """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 
@@ -110,16 +112,19 @@ def serve(transport):
 
 
 def _hook_options(command):
-    command = click.option("--agent", type=click.Choice(["claude"]), default="claude")(
-        command
-    )
+    command = click.option(
+        "--agent", type=click.Choice(["claude", "codex"]), default="claude"
+    )(command)
     command = click.option("--global", "global_scope", is_flag=True)(command)
     return click.option(
         "--state-dir", type=click.Path(path_type=Path), default=default_state_dir
     )(command)
 
 
-def _hook_settings(global_scope):
+def _hook_settings(global_scope, agent="claude"):
+    if agent == "codex":
+        home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        return (home if global_scope else Path.cwd() / ".codex") / "hooks.json"
     return (
         Path.home() / ".claude" / "settings.json"
         if global_scope
@@ -130,19 +135,28 @@ def _hook_settings(global_scope):
 @main.command("init")
 @_hook_options
 def init_hooks(agent, global_scope, state_dir):
-    """Install local Claude tool hooks. Prompts/attachments are not intercepted."""
+    """Install local agent tool hooks. Prompts/attachments are not intercepted."""
     try:
-        backup = configure(_hook_settings(global_scope), state_dir, install=True)
+        backup = configure(
+            _hook_settings(global_scope, agent),
+            agent_state_dir(state_dir, agent),
+            install=True,
+            agent=agent,
+        )
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
     click.echo(
-        "Claude tool hooks installed. Restart Claude Code; run secure-mcp doctor."
+        f"{agent} tool hooks installed. Restart the agent; run secure-mcp doctor --agent {agent}."
     )
     click.echo(
         "Scope: tool text only. Direct prompts, attachments and telemetry are not covered."
     )
     if backup:
         click.echo(f"Settings backup: {backup}")
+    if agent == "codex":
+        click.echo(
+            "Codex: review/trust these hooks using /hooks. Screen restoration is not available."
+        )
 
 
 @main.command("uninstall")
@@ -150,11 +164,16 @@ def init_hooks(agent, global_scope, state_dir):
 def uninstall_hooks(agent, global_scope, state_dir):
     """Remove only SecureMCP hooks; preserve other settings and encrypted state."""
     try:
-        configure(_hook_settings(global_scope), state_dir, install=False)
+        configure(
+            _hook_settings(global_scope, agent),
+            agent_state_dir(state_dir, agent),
+            install=False,
+            agent=agent,
+        )
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
     click.echo(
-        "SecureMCP hooks removed. Restart Claude Code. Encrypted state is retained."
+        "SecureMCP hooks removed. Restart the agent. Encrypted state is retained."
     )
 
 
@@ -163,7 +182,11 @@ def uninstall_hooks(agent, global_scope, state_dir):
 def doctor(agent, global_scope, state_dir):
     """Inspect hook registration. Host-version compatibility needs a real smoke test."""
     try:
-        status = installation_status(_hook_settings(global_scope), state_dir)
+        status = installation_status(
+            _hook_settings(global_scope, agent),
+            agent_state_dir(state_dir, agent),
+            agent,
+        )
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
     click.echo(json.dumps(status, ensure_ascii=False))
@@ -172,23 +195,27 @@ def doctor(agent, global_scope, state_dir):
 
 
 @main.command()
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
 @click.option("--session-id", required=True)
-def stats(state_dir, session_id):
+def stats(agent, state_dir, session_id):
     """Show local hook session counters, without original values or mappings."""
     from secure_mcp.hooks import HookStore
 
     try:
-        with HookStore(state_dir).session(session_id) as session:
+        with HookStore(agent_state_dir(state_dir, agent)).session(
+            session_id
+        ) as session:
             click.echo(session.get_stats().model_dump_json() if session else "{}")
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
 
 
 @main.command(hidden=True)
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--state-dir", type=click.Path(path_type=Path), required=True)
-def hook(state_dir):
-    """JSON stdin/stdout entry point invoked by Claude Code, never by an MCP model."""
+def hook(agent, state_dir):
+    """JSON stdin/stdout entry point invoked by the local agent, never by an MCP model."""
     payload = None
     try:
         if hasattr(sys.stdin, "reconfigure"):
@@ -196,7 +223,7 @@ def hook(state_dir):
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object.")
-        result = handle_hook(payload, state_dir)
+        result = handle_hook(payload, state_dir, agent)
         click.echo(json.dumps(result, ensure_ascii=False))
     except (ValueError, OSError, TypeError, AssertionError):
         # Do not echo raw payloads or exception messages containing secret candidates.
@@ -212,6 +239,20 @@ def hook(state_dir):
                     }
                 )
             )
+        elif (
+            agent == "codex"
+            and isinstance(payload, dict)
+            and payload.get("hook_event_name") == "PostToolUse"
+        ):
+            # Codex can replace a failed transformation with sanitized feedback.
+            click.echo(
+                json.dumps(
+                    {
+                        "continue": False,
+                        "stopReason": "SecureMCP could not mask this tool result; original output withheld.",
+                    }
+                )
+            )
         else:
             click.echo(
                 "SecureMCP hook failed; original host output may be used.", err=True
@@ -220,14 +261,15 @@ def hook(state_dir):
 
 
 @main.command("exec", context_settings={"ignore_unknown_options": True})
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
 @click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
 @click.option("--session-id", required=True)
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
-def exec_masked(state_dir, session_id, command):
+def exec_masked(agent, state_dir, session_id, command):
     """Run executable + arguments locally; return only masked stdout/stderr (no implicit shell)."""
     from secure_mcp.hooks import HookStore
 
-    store = HookStore(state_dir)
+    store = HookStore(agent_state_dir(state_dir, agent))
     try:
         with store.session(session_id) as session:
             restored = [store.restore(arg, session) for arg in command]
@@ -247,6 +289,28 @@ def exec_masked(state_dir, session_id, command):
         if completed.returncode >= 0
         else 128 - completed.returncode
     )
+
+
+@main.command("restore")
+@click.option("--agent", type=click.Choice(["claude", "codex"]), default="claude")
+@click.option("--state-dir", type=click.Path(path_type=Path), default=default_state_dir)
+@click.option("--session-id", required=True)
+def restore_hook_text(agent, state_dir, session_id):
+    """Restore UTF-8 stdin using a local hook session, for user display only."""
+    from secure_mcp.hooks import HookStore
+
+    store = HookStore(agent_state_dir(state_dir, agent))
+    try:
+        if hasattr(sys.stdin, "reconfigure"):
+            sys.stdin.reconfigure(encoding="utf-8")
+        text = sys.stdin.read()
+        with store.session(session_id) as session:
+            restored = store.restore(text, session)
+    except (ValueError, OSError):
+        raise click.ClickException(
+            "Local restoration failed; check the session and placeholders."
+        ) from None
+    click.echo(restored, nl=False)
 
 
 @main.command()
