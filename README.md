@@ -1,6 +1,29 @@
-# SecureMCP
+<div align="center">
 
-Local English/Korean text masking and code review representations, with session-based restoration.
+# 🛡️ SecureMCP
+
+**Local English/Korean Masking · Claude Code Hooks · Trusted Restoration**
+
+*영어·한국어·코드를 로컬에서 마스킹하고, 도구 실행과 사용자 화면에서 원문을 복원하는 개인정보 보호 도구*
+
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](pyproject.toml)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-brightgreen.svg)](pyproject.toml)
+[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](.github/workflows/ci.yml)
+[![CI](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/mj10612/SecureMCP/actions/workflows/ci.yml)
+[![MCP](https://img.shields.io/badge/Protocol-MCP-orange.svg)](docs/ARCHITECTURE.md)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+---
+
+[English](#english-overview) · [한국어 안내](#한국어-안내-korean-overview) · [Supported Versions](#supported-versions) · [Quick Start](#quick-start) · [Features](#features) · [Architecture](#system-architecture) · [Documentation](#documentation)
+
+---
+
+</div>
+
+## English Overview
+
+**SecureMCP** masks English/Korean text and code locally, with session-based restoration.
 
 Version 0.3 adds local Claude Code hooks without an API gateway. Install with `uv tool install .`,
 then run `secure-mcp init --agent claude` and `secure-mcp doctor`. This opt-in integration masks
@@ -8,18 +31,55 @@ supported tool text and restores local execution/display values; direct prompts,
 telemetry and unknown output fields are not covered. See [local integration](docs/LOCAL_INTEGRATION.md)
 for installation, removal, the `exec` wrapper and exact failure behavior.
 
-## English
-
 Mask confidential input **before** sending it to a provider. Restore responses in your trusted
 local application and show them to the user there. Model-invoked MCP tool arguments are already
 visible to the provider; adding this server to Claude Desktop or Cursor does not automatically
 intercept or protect prompts. Restored originals must not be sent back into the model context.
 This is heuristic masking, not a proof of anonymity, cryptographic zero knowledge, or regulatory compliance.
 
+---
+
+## Supported Versions
+
+| Component | Supported versions / scope |
+| :--- | :--- |
+| SecureMCP | **0.3.0** |
+| Python | **3.10 · 3.11 · 3.12 · 3.13 · 3.14** in CI; package requires Python ≥ 3.10 |
+| Operating systems | **Windows · macOS · Linux** in CI |
+| Claude Code integration | Hosts supporting `updatedToolOutput` and `MessageDisplay`; validate your installed version before use |
+| MCP transport | Local **stdio**; CLI HTTP/SSE transports are disabled |
+| Natural languages | **English · 한국어 · mixed input** |
+| Code languages | Python · JavaScript · TypeScript · Go · Rust · Java · C · C++ · SQL |
+
+The [CI matrix](.github/workflows/ci.yml) covers 15 Python/OS combinations. Code-language
+support describes lexer modes, not compatibility with every language release or compiler.
+Claude Code hooks are experimental; a supported host API does not certify all-traffic privacy.
+
+---
+
+## Quick Start
+
+### Local CLI and Claude Code hooks
+
 ```bash
-uv pip install -e ".[dev]"
-python -m secure_mcp demo
+uv tool install .
+secure-mcp init --agent claude
+secure-mcp doctor
 ```
+
+Restart Claude Code after installation. Hooks default to the current project; use `--global`
+for user-wide registration. See [local integration](docs/LOCAL_INTEGRATION.md) for supported
+tool fields, installation/removal and limitations.
+
+### Development installation and demo
+
+```bash
+uv venv
+uv pip install -e ".[dev]"
+uv run python -m secure_mcp demo
+```
+
+### Trusted local Python API
 
 ```python
 from secure_mcp import LocalPrivacyClient
@@ -36,7 +96,20 @@ with LocalPrivacyClient() as client:
     print(result.unmasked_text)  # Local display only
 ```
 
-### Policies and supported inputs
+---
+
+## Features
+
+| Feature | Behavior |
+| :--- | :--- |
+| 🌐 English & Korean | Per-word multilingual handling, conservative Korean particle separation and explicit sensitive terms |
+| 🧩 Code-aware masking | Language-specific lexer modes for identifiers, literals, numbers and comments |
+| 🎭 Four surrogate strategies | Bracket, Unicode, delimited pseudoword and random hash representations |
+| 🔌 Local Claude Code hooks | Tool-text masking, local execution-argument restoration and display-only restoration |
+| 🔐 Session management | Stable per-session mappings, operation locks, idle expiry and opt-in encrypted snapshots |
+| 🛠️ CLI & Python API | Local masking/restoration, hook diagnostics, statistics and a buffered command wrapper |
+
+### Masking policies
 
 | Mode | Behavior |
 | --- | --- |
@@ -53,16 +126,28 @@ for domain names, lowercase names, ambiguous names, and custom secrets. `custom_
 Unknown secret formats and context-dependent names may evade `entities_only`; inspect the payload
 or use broader masking. A high masking ratio does not prove absence of sensitive data.
 
-Strategies: `bracket` (`[ENT_1]`), `unicode` (`⟦ENT_1⟧`), `pseudoword` (`⟪Brivel…⟫`),
-and `hash` (random 96-bit nonce, independent of the original). Pseudowords use explicit delimiters
+### Surrogate strategies
+
+| Strategy | Representation |
+| :--- | :--- |
+| `bracket` | `[ENT_1]` |
+| `unicode` | `⟦ENT_1⟧` |
+| `pseudoword` | Explicitly delimited pronounceable words, e.g. `⟪Brivel…⟫` |
+| `hash` | Random 96-bit nonce, independent of the original |
+
+Pseudowords use explicit delimiters
 to avoid collisions with real words and adjacent tokens. Allocation is stable within a session;
 random strategies intentionally differ between sessions. Keep all surrogate spelling intact.
 Altered/unknown placeholder candidates are reported in `unmatched_surrogates`; `strict=True`
 rejects them. Free-form deletion or invention by a model cannot always be detected or reconstructed.
 
+### Korean restoration
+
 Exact mask/unmask roundtrips keep written particles. For newly generated Korean responses,
 opt into `normalize_particles=True` (CLI `--normalize-particles`) to choose 이/가, 은/는, 을/를,
 과/와 and 으로/로 from a restored Hangul stem. Pronunciation of foreign names is not guessed.
+
+### Code-aware review representations
 
 Code languages: `python`, `javascript`, `typescript`, `go`, `rust`, `java`, `c`, `cpp`, `sql`.
 Use explicit `language` in `mask_code` (CLI `--code-language`) for ambiguous snippets.
@@ -76,7 +161,27 @@ is syntax-checked in tests. Output is an opaque review representation: it need n
 type-check, retain numeric types/values, or preserve f-string/template interpolation behavior. This
 small lexer is not a complete parser for every version of every supported language.
 
-### CLI and sessions
+---
+
+## System Architecture
+
+```mermaid
+flowchart LR
+    Input[Trusted local input] --> Mask[Masking engine]
+    Mask -->|Masked payload| Provider[AI provider callback]
+    Provider -->|Surrogate response| Restore[Local restoration]
+    Restore --> Display[User display]
+    Vault[Local session mappings] --- Mask
+    Vault --- Restore
+```
+
+The callback path masks input before the provider receives it. Claude Code hooks use a separate,
+partial tool-text path; they do not intercept all outgoing context. See the
+[architecture](docs/ARCHITECTURE.md) and [local integration](docs/LOCAL_INTEGRATION.md) documents.
+
+---
+
+## CLI and Sessions
 
 ```bash
 python -m secure_mcp mask "Alice from Google" --session-id example --session-file example.enc --json-output
@@ -108,11 +213,21 @@ occurrences. Deprecated `privacy_entropy_score` is an alias, not information ent
 `restored_occurrences` counts replacements; `restored_unique_tokens` counts distinct allocations.
 `restored_tokens_count` remains a compatibility alias for replacement occurrences.
 
-### MCP utilities
+---
+
+## MCP Tools Reference
 
 `python -m secure_mcp serve` supports local stdio only. HTTP/SSE transports are disabled in the CLI;
 directly exposing the Python server over a network requires host-provided authentication and isolation.
-Tools: `mask_text`, `mask_code`, `create_privacy_session`, `get_session_stats`, `clear_privacy_session`.
+
+| MCP tool | Purpose |
+| :--- | :--- |
+| `mask_text` | Mask text with a selected policy and session |
+| `mask_code` | Create a code review representation using a selected language lexer |
+| `create_privacy_session` | Create an isolated mapping session |
+| `get_session_stats` | Return counters without original values or mapping entries |
+| `clear_privacy_session` | Release the session's mapping references |
+
 Local Python `unmask_text` / `unmask_code` and CLI `unmask` are **not registered as MCP tools**,
 so a model cannot enumerate mappings via restoration. Resources: `privacy://policies`, `privacy://status`.
 Example desktop configurations are utility setups, not privacy proxies.
@@ -124,7 +239,9 @@ Version 0.2 changes pseudoword delimiters, code identifier/number representation
 preservation, and the MCP restoration boundary. Direct store readers should use mapping values
 or `mapping_key`. Validate explicitly requested strategies; omitted strategies follow the generator.
 
-## 한국어
+---
+
+## 한국어 안내 (Korean Overview)
 
 0.3에서는 게이트웨이 없이 사용하는 로컬 Claude Code Hook을 추가했습니다. `uv tool install .`
 설치 후 `secure-mcp init --agent claude`, `secure-mcp doctor`를 실행하세요. 지원하는 도구
@@ -152,6 +269,8 @@ SecureMCP는 영어·한국어·혼합 문장을 로컬에서 마스킹하고 �
 삭제와 진행 중 작업을 잠금으로 조율합니다. 별도 CLI 프로세스 간 복원에는 동일한 암호화
 `--session-file`이 필요합니다. 마스킹 비율은 통계이며 기밀성·익명성·규제 준수의 증명이 아닙니다.
 
+---
+
 ## Development
 
 ```bash
@@ -160,4 +279,15 @@ python -m mypy src
 python -m pytest -W error --cov=secure_mcp --cov-report=term-missing --cov-fail-under=85
 ```
 
-[Architecture](docs/ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+---
+
+## Documentation
+
+- [Local Claude Code Integration / 로컬 연동 안내](docs/LOCAL_INTEGRATION.md)
+- [System Architecture](docs/ARCHITECTURE.md)
+- [Issue Resolution and Review Notes](docs/ISSUE_RESOLUTION.md)
+- [Contributing Guidelines](CONTRIBUTING.md)
+
+## License
+
+Licensed under **Apache License 2.0**. See [LICENSE](LICENSE) for details.
