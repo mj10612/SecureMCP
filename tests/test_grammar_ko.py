@@ -1,9 +1,7 @@
 """Tests for Korean grammar, particle decomposition, and token classification."""
 
-import pytest
 from secure_mcp.engine.grammar_ko import (
     KoreanGrammarEngine,
-    is_hangul_char,
     is_hangul_string,
     has_batchim,
 )

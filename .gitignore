@@ -31,7 +31,11 @@ env/
 # Testing & Coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.enc.lock
 .tox/
 .nox/
 

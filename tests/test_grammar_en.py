@@ -1,6 +1,5 @@
 """Tests for English grammar and token classification."""
 
-import pytest
 from secure_mcp.engine.grammar_en import EnglishGrammarEngine, CLOSED_CLASS_WORDS
 from secure_mcp.models import TokenType
 
@@ -20,7 +19,7 @@ def test_classify_grammar_words():
 
 def test_classify_entities():
     # Capitalized proper noun (not sentence start)
-    token_type, should_mask = EnglishGrammarEngine.classify_token("Microsoft", is_sentence_start=False)
+    token_type, should_mask = EnglishGrammarEngine.classify_token("Microsoft")
     assert token_type == TokenType.ENTITY
     assert should_mask
 
@@ -35,7 +34,9 @@ def test_classify_entities():
     assert should_mask
 
     # Secret API key
-    token_type, should_mask = EnglishGrammarEngine.classify_token("sk-proj-1234567890abcdef")
+    token_type, should_mask = EnglishGrammarEngine.classify_token(
+        "sk-proj-1234567890abcdef"
+    )
     assert token_type == TokenType.ENTITY
     assert should_mask
 

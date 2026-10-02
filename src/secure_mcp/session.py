@@ -1,154 +1,225 @@
-"""Thread-safe session vault managing ephemeral token substitution tables."""
+"""Session operation locks, bounded lifetimes, and periodic idle cleanup."""
 
 from __future__ import annotations
 
+import math
+from threading import Event, RLock, Thread
 import time
 import uuid
-from threading import Lock
-from typing import Dict, Optional, Tuple
+import weakref
 
 from secure_mcp.engine.strategies import StrategyGenerator
-from secure_mcp.models import (
-    MaskMode,
-    SessionStats,
-    SurrogateStrategy,
-    TokenMapping,
-)
+from secure_mcp.models import MaskMode, SessionStats, SurrogateStrategy, TokenMapping
+
+
+def validate_ttl(ttl: float) -> None:
+    if isinstance(ttl, bool) or not math.isfinite(ttl) or not 0 < ttl <= 86400:
+        raise ValueError("ttl_seconds must be positive and at most 86400 (one day).")
+
+
+class SessionMappings(dict[str, TokenMapping]):
+    """Public stores must be accessed inside session.operation() when mutated."""
+
+    def __init__(self, generator: StrategyGenerator):
+        super().__init__()
+        self.generator = generator
 
 
 class PrivacySession:
-    """An isolated privacy session holding bidirectional substitution tables."""
-
     def __init__(
         self,
         session_id: str,
         mode: MaskMode = MaskMode.CONTENT_WORDS,
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
-        ttl_seconds: int = 3600,
+        ttl_seconds: float = 3600,
         salt: str = "",
     ):
+        validate_ttl(ttl_seconds)
         self.session_id = session_id
         self.mode = mode
         self.strategy = strategy
         self.ttl_seconds = ttl_seconds
-        self.created_at = time.time()
-        self.last_accessed = self.created_at
-        self.total_mask_calls = 0
-        self.total_unmask_calls = 0
+        self.created_at = self.last_accessed = time.time()
+        self.total_mask_calls = self.total_unmask_calls = 0
+        self.generator = StrategyGenerator(strategy=strategy, salt=salt)
+        self.forward_store = SessionMappings(self.generator)
+        self.reverse_store = SessionMappings(self.generator)
 
-        self.generator = StrategyGenerator(strategy=strategy, salt=salt or session_id)
-        self.forward_store: Dict[str, TokenMapping] = {}
-        self.reverse_store: Dict[str, TokenMapping] = {}
+    def operation(self):
+        """Use this context for counters, settings, and custom store mutations."""
+        return self.generator.operation()
 
     def is_expired(self) -> bool:
-        """Return True if session has exceeded its Time-To-Live."""
-        return (time.time() - self.last_accessed) > self.ttl_seconds
+        with self.generator.lock:
+            return time.time() - self.last_accessed > self.ttl_seconds
 
     def touch(self) -> None:
-        """Refresh last accessed timestamp."""
-        self.last_accessed = time.time()
+        with self.generator.operation():
+            self.last_accessed = time.time()
 
     def clear(self) -> None:
-        """Securely wipe substitution tables from memory."""
-        self.forward_store.clear()
-        self.reverse_store.clear()
+        with self.generator.lock:
+            self.generator.closed = True
+            self.forward_store.clear()
+            self.reverse_store.clear()
+            self.generator.used_surrogates.clear()
+            self.generator._type_counters.clear()
+            self.generator.salt = ""
 
     def get_stats(self) -> SessionStats:
-        """Return sanitized metrics with zero raw token disclosure."""
-        type_counts: Dict[str, int] = {}
-        for m in self.forward_store.values():
-            cat = m.token_type.value
-            type_counts[cat] = type_counts.get(cat, 0) + 1
-
-        return SessionStats(
-            session_id=self.session_id,
-            created_at=self.created_at,
-            last_accessed=self.last_accessed,
-            total_unique_mappings=len(self.forward_store),
-            total_mask_calls=self.total_mask_calls,
-            total_unmask_calls=self.total_unmask_calls,
-            mode=self.mode,
-            strategy=self.strategy,
-            type_distribution=type_counts,
-        )
+        with self.operation():
+            counts: dict[str, int] = {}
+            for mapping in self.forward_store.values():
+                name = mapping.token_type.value
+                counts[name] = counts.get(name, 0) + 1
+            return SessionStats(
+                session_id=self.session_id,
+                created_at=self.created_at,
+                last_accessed=self.last_accessed,
+                total_unique_mappings=len(self.forward_store),
+                total_mask_calls=self.total_mask_calls,
+                total_unmask_calls=self.total_unmask_calls,
+                mode=self.mode,
+                strategy=self.strategy,
+                type_distribution=counts,
+            )
 
 
 class SessionVault:
-    """Thread-safe vault managing all active privacy sessions with automatic cleanup."""
+    """Registry is locked; built-in engine operations share each session's RLock."""
 
-    def __init__(self, default_ttl: int = 3600):
+    def __init__(
+        self, default_ttl: float = 3600, cleanup_interval: float | None = None
+    ):
+        validate_ttl(default_ttl)
         self.default_ttl = default_ttl
-        self._sessions: Dict[str, PrivacySession] = {}
-        self._lock = Lock()
-        self.default_session_id = "default_session"
+        self.default_session_id = f"sess_{uuid.uuid4().hex}"
+        self._sessions: dict[str, PrivacySession] = {}
+        self._lock = RLock()
+        self._stop = Event()
+        self._closed = False
+        self._thread: Thread | None = None
+        self.cleanup_interval = cleanup_interval or min(1.0, default_ttl / 2)
+        if self.cleanup_interval <= 0:
+            raise ValueError("cleanup_interval must be positive")
+
+    def _sid(self, session_id: str | None) -> str:
+        return (
+            session_id.strip()
+            if session_id and session_id.strip()
+            else self.default_session_id
+        )
+
+    def _start_cleanup_locked(self) -> None:
+        if self._thread is None:
+            self._thread = Thread(
+                target=self._sweep,
+                args=(weakref.ref(self), self._stop, self.cleanup_interval),
+                daemon=True,
+            )
+            self._thread.start()
+
+    @staticmethod
+    def _sweep(
+        reference: weakref.ReferenceType[SessionVault], stop: Event, interval: float
+    ) -> None:
+        while not stop.wait(interval):
+            vault = reference()
+            if vault is None:
+                return
+            with vault._lock:
+                vault._cleanup_expired_locked()
+            del vault
 
     def get_or_create(
         self,
-        session_id: Optional[str] = None,
+        session_id: str | None = None,
         mode: MaskMode = MaskMode.CONTENT_WORDS,
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
     ) -> PrivacySession:
-        """Get existing session or initialize a fresh one."""
+        with self._lock:
+            if self._closed:
+                raise ValueError("Session vault is closed.")
+            self._cleanup_expired_locked()
+            sid = self._sid(session_id)
+            if sid in self._sessions:
+                session = self._sessions[sid]
+                with session.operation():
+                    if session.strategy != strategy:
+                        raise ValueError(
+                            f"Session '{sid}' uses strategy '{session.strategy.value}'; cannot switch to '{strategy.value}'. Use a new session ID."
+                        )
+                    # mode is a last-used policy, not an immutable allocation format.
+                    session.mode = mode
+                    session.touch()
+                    return session
+            return self.create(sid, mode, strategy, self.default_ttl)
+
+    def create(
+        self,
+        session_id: str | None = None,
+        mode: MaskMode = MaskMode.CONTENT_WORDS,
+        strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
+        ttl_seconds: float | None = None,
+    ) -> PrivacySession:
+        ttl = self.default_ttl if ttl_seconds is None else ttl_seconds
+        validate_ttl(ttl)
+        with self._lock:
+            if self._closed:
+                raise ValueError("Session vault is closed.")
+            self._cleanup_expired_locked()
+            sid = self._sid(session_id)
+            if sid in self._sessions:
+                raise ValueError(
+                    f"Session '{sid}' already exists. Use a new ID or clear it first."
+                )
+            session = PrivacySession(sid, mode, strategy, ttl)
+            self._sessions[sid] = session
+            self._start_cleanup_locked()
+            return session
+
+    def get_session(self, session_id: str) -> PrivacySession | None:
         with self._lock:
             self._cleanup_expired_locked()
+            session = self._sessions.get(self._sid(session_id))
+            if session:
+                session.touch()
+            return session
 
-            sid = session_id.strip() if (session_id and session_id.strip()) else self.default_session_id
-            if sid in self._sessions:
-                sess = self._sessions[sid]
-                if sess.strategy != strategy:
-                    raise ValueError(
-                        f"Session '{sid}' uses strategy '{sess.strategy.value}'; "
-                        f"cannot switch to '{strategy.value}'. Use a new session ID."
-                    )
-                sess.touch()
-                return sess
-
-            sess = PrivacySession(
-                session_id=sid,
-                mode=mode,
-                strategy=strategy,
-                ttl_seconds=self.default_ttl,
-            )
-            self._sessions[sid] = sess
-            return sess
-
-    def get_session(self, session_id: str) -> Optional[PrivacySession]:
-        """Fetch session if present and not expired."""
+    @property
+    def active_count(self) -> int:
         with self._lock:
-            sid = session_id.strip() if session_id else self.default_session_id
-            sess = self._sessions.get(sid)
-            if sess:
-                if sess.is_expired():
-                    sess.clear()
-                    del self._sessions[sid]
-                    return None
-                sess.touch()
-                return sess
-            return None
+            self._cleanup_expired_locked()
+            return len(self._sessions)
 
     def clear_session(self, session_id: str) -> bool:
-        """Securely wipe a specific session."""
         with self._lock:
-            sid = session_id.strip() if session_id else self.default_session_id
-            if sid in self._sessions:
-                self._sessions[sid].clear()
-                del self._sessions[sid]
+            session = self._sessions.pop(self._sid(session_id), None)
+            if session:
+                session.clear()  # waits for any active mask/unmask before invalidation
                 return True
             return False
 
     def clear_all(self) -> int:
-        """Clear all active sessions."""
         with self._lock:
             count = len(self._sessions)
-            for sess in self._sessions.values():
-                sess.clear()
+            for session in self._sessions.values():
+                session.clear()
             self._sessions.clear()
             return count
 
+    def close(self) -> None:
+        self._stop.set()
+        with self._lock:
+            self._closed = True
+            self.clear_all()
+        if self._thread:
+            self._thread.join(timeout=2)
+
     def _cleanup_expired_locked(self) -> None:
-        """Internal helper to prune expired sessions."""
-        now = time.time()
-        expired = [sid for sid, s in self._sessions.items() if (now - s.last_accessed) > s.ttl_seconds]
-        for sid in expired:
-            self._sessions[sid].clear()
-            del self._sessions[sid]
+        for sid in list(self._sessions):
+            session = self._sessions[sid]
+            with session.generator.lock:
+                if session.is_expired():
+                    session.clear()
+                    del self._sessions[sid]

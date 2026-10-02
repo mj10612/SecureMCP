@@ -3,70 +3,87 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal
 from pydantic import BaseModel, Field, computed_field
 
 
 class MaskMode(str, Enum):
     """Masking policy mode defining which token classes are obfuscated."""
-    CONTENT_WORDS = "content_words"   # Preserves grammar & syntax; masks nouns, content terms, numbers, entities
-    ENTITIES_ONLY = "entities_only"   # Masks only recognized entities (PII, names, emails, IPs, numbers)
-    CODE_AWARE = "code_aware"         # Preserves language syntax/keywords; masks identifiers, literals, secrets
-    AGGRESSIVE = "aggressive"         # Obfuscates all tokens except essential structural function words
+
+    CONTENT_WORDS = "content_words"  # Preserves grammar & syntax; masks nouns, content terms, numbers, entities
+    ENTITIES_ONLY = "entities_only"  # Masks only recognized entities (PII, names, emails, IPs, numbers)
+    CODE_AWARE = "code_aware"  # Preserves language syntax/keywords; masks identifiers, literals, secrets
+    AGGRESSIVE = (
+        "aggressive"  # Obfuscates all tokens except essential structural function words
+    )
 
 
 class SurrogateStrategy(str, Enum):
     """Strategy for generating synthetic surrogate tokens."""
-    BRACKET = "bracket"       # e.g., [ENTITY_1], [TERM_1], [NUM_1]
-    UNICODE = "unicode"       # e.g., ⟦ENT_1⟧, ⟦VAL_1⟧ (resists BPE sub-token splits)
-    PSEUDOWORD = "pseudoword" # e.g., Brivon, Cranley, Velmor (natural cadence, zero perplexity spike)
-    HASH = "hash"             # e.g., ~h8f2~ (compact cryptographic nonce)
+
+    BRACKET = "bracket"  # e.g., [ENTITY_1], [TERM_1], [NUM_1]
+    UNICODE = "unicode"  # e.g., ⟦ENT_1⟧
+    PSEUDOWORD = "pseudoword"  # Explicitly delimited pronounceable random words
+    HASH = "hash"  # Random 96-bit nonce, independent of the original
 
 
 class TokenType(str, Enum):
     """Linguistic and structural token classifications."""
-    GRAMMAR = "grammar"         # Functional word, preposition, particle, syntax marker
-    ENTITY = "entity"           # Named entity (Person, Org, Location, etc.)
-    NOUN = "noun"               # Substantive noun / concept
-    VERB = "verb"               # Content verb
-    ADJECTIVE = "adjective"     # Descriptive adjective/adverb
-    NUMBER = "number"           # Numeric literal / currency / measurement
-    IDENTIFIER = "identifier"   # Code variable / function / class name
-    LITERAL = "literal"         # String or character literal
-    UNKNOWN = "unknown"         # General content token
+
+    GRAMMAR = "grammar"  # Functional word, preposition, particle, syntax marker
+    ENTITY = "entity"  # Named entity (Person, Org, Location, etc.)
+    NOUN = "noun"  # Substantive noun / concept
+    VERB = "verb"  # Content verb
+    ADJECTIVE = "adjective"  # Descriptive adjective/adverb
+    NUMBER = "number"  # Numeric literal / currency / measurement
+    IDENTIFIER = "identifier"  # Code variable / function / class name
+    LITERAL = "literal"  # String or character literal
+    UNKNOWN = "unknown"  # General content token
 
 
 class TokenMapping(BaseModel):
     """Bi-directional mapping between original token and synthetic surrogate."""
+
     original: str
     surrogate: str
     token_type: TokenType = TokenType.UNKNOWN
     occurrence_count: int = 1
     is_capitalized: bool = False
     is_all_caps: bool = False
-    category_index: int = 1
+    context: Literal["text", "code"] = "text"
+    format_version: int = Field(default=2, ge=1, le=2)
 
 
 class MaskResult(BaseModel):
     """Result returned after masking text or code."""
+
     masked_text: str
     session_id: str
     total_tokens: int
     masked_tokens: int
     preserved_tokens: int
     privacy_entropy_score: float = Field(
-        ..., description="Information obfuscation metric between 0.0 (no masking) and 1.0 (full non-grammatical masking)"
+        ...,
+        description="Deprecated alias of masked_ratio; token occurrence ratio, not entropy or a security guarantee",
     )
     strategy: SurrogateStrategy
     mode: MaskMode
     detected_language: str = "en"
+    code_language: str | None = None
+
+    @computed_field
+    def masked_ratio(self) -> float:
+        """Masked / non-whitespace, non-punctuation token occurrences."""
+        return self.privacy_entropy_score
 
 
 class UnmaskResult(BaseModel):
     """Result returned after restoring original tokens from AI response."""
+
     unmasked_text: str
     session_id: str
     restored_tokens_count: int
+    restored_unique_tokens: int = 0
     unmatched_surrogates: List[str] = Field(
         default_factory=list,
         description="Surrogate tokens found in text that had no matching session mapping",
@@ -77,9 +94,14 @@ class UnmaskResult(BaseModel):
         """Alias for code unmasking operations."""
         return self.unmasked_text
 
+    @computed_field
+    def restored_occurrences(self) -> int:
+        return self.restored_tokens_count
+
 
 class SessionStats(BaseModel):
     """Sanitized session metrics that never reveal proprietary raw tokens."""
+
     session_id: str
     created_at: float
     last_accessed: float

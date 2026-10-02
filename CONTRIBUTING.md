@@ -28,7 +28,9 @@ We are committed to providing a welcoming and inclusive environment for everyone
 
 3. **Run the test suite:**
    ```bash
-   pytest -v
+   python -m ruff check src tests examples
+   python -m mypy src
+   python -m pytest -W error --cov=secure_mcp --cov-report=term-missing --cov-fail-under=85
    ```
 
 4. **Run the demo and benchmark:**
@@ -43,4 +45,4 @@ We are committed to providing a welcoming and inclusive environment for everyone
 
 1. Ensure all existing tests pass and write new unit tests for any added features or bug fixes.
 2. Maintain clean type annotations and follow PEP 8 standards.
-3. Keep the zero-knowledge local storage contract intact: under no circumstances should mapping tables be dispatched to external networks.
+3. Keep originals and mapping tables in the trusted local host. Restore for local display, outside the provider/model context.

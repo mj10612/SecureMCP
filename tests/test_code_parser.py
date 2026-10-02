@@ -1,7 +1,6 @@
 """Tests for code syntax and keyword preservation parser."""
 
-import pytest
-from secure_mcp.engine.code_parser import CodeParser, CODE_KEYWORDS
+from secure_mcp.engine.code_parser import CodeParser
 from secure_mcp.models import TokenType
 
 

@@ -1,6 +1,5 @@
 """Tests for core masking engine (masking, unmasking, round-trip restoration)."""
 
-import pytest
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.engine.strategies import StrategyGenerator
 from secure_mcp.models import MaskMode, SurrogateStrategy
@@ -62,7 +61,9 @@ def test_roundtrip_korean_text():
     assert "와 " in mask_res.masked_text or "와" in mask_res.masked_text
 
     simulated_ai = mask_res.masked_text
-    unmask_res = engine.unmask(simulated_ai, "test_ko", reverse, strategy=SurrogateStrategy.UNICODE)
+    unmask_res = engine.unmask(
+        simulated_ai, "test_ko", reverse, strategy=SurrogateStrategy.UNICODE
+    )
     assert unmask_res.unmasked_text == text
 
 

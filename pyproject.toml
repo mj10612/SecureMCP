@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "secure-mcp"
-version = "0.1.0"
-description = "Grammar-Preserving Zero-Knowledge Semantic Masking & Anonymization MCP Server for LLMs"
+version = "0.2.0"
+description = "Local English/Korean masking and trusted-client restoration with MCP utilities"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -22,7 +22,6 @@ keywords = [
     "openai",
     "claude",
     "anthropic",
-    "zero-knowledge",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -34,6 +33,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Security",
 ]
@@ -49,6 +49,9 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.20.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.9",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
@@ -61,3 +64,21 @@ packages = ["src/secure_mcp"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+source = ["secure_mcp"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true

@@ -1,95 +1,44 @@
-# SecureMCP Technical Architecture
+# Architecture and trust boundary
 
-SecureMCP operates as an intelligent local proxy implementing the Model Context Protocol (MCP). It intercepts text and code prompts before they are dispatched to remote AI endpoints, obscuring sensitive semantic tokens while preserving the grammatical and syntactic backbone.
-
----
-
-## 1. High-Level System Architecture
-
-```mermaid
-flowchart TD
-    subgraph Client ["Client Workstation (Claude Desktop / Cursor / Custom Agent)"]
-        UserPrompt["Raw User Prompt / Code"] --> Tokenizer["Multilingual Tokenizer"]
-        Tokenizer --> Classifier["Grammar & Syntax Classifier"]
-        
-        subgraph Vault ["Secure Session Vault (Local RAM)"]
-            FwdMap["Forward Table: Original -> Surrogate"]
-            RevMap["Reverse Table: Surrogate -> Original"]
-        end
-        
-        Classifier -->|Content Tokens| Masker["Masking Engine"]
-        Classifier -->|Function Words / Syntax| Skeleton["Grammar Preserver"]
-        Masker <--> Vault
-        
-        Skeleton --> Assembled["Masked Prompt"]
-    end
-    
-    subgraph Cloud ["Remote AI Provider (OpenAI / Anthropic Claude)"]
-        Assembled -->|Encrypted HTTPS API| LLM["LLM Reasoning & Generation"]
-        LLM --> AIResponse["AI Response (Contains Surrogates)"]
-    end
-    
-    subgraph Restoration ["Local Restoration Pipeline"]
-        AIResponse --> Unmasker["SecureMCP Unmasker"]
-        Unmasker <--> RevMap
-        Unmasker --> FinalOutput["Restored Confidential Output"]
-    end
-```
-
----
-
-## 2. Linguistic Decomposition Pipeline
-
-### English Syntax Separation
 ```mermaid
 flowchart LR
-    Token["Input Token"] --> CheckClosed{"Is Closed-Class Word?"}
-    CheckClosed -->|Yes: the, in, with, is, and...| Preserve["Preserve As Grammar"]
-    CheckClosed -->|No| CheckEntity{"Is Entity / Number / Secret?"}
-    CheckEntity -->|Yes: Company, Email, $43M| GenEntity["Assign [ENT_n] / [NUM_n]"]
-    CheckEntity -->|No: 일반 명사 / 동사| GenContent["Assign [NOUN_n] / [VERB_n]"]
+    Raw[Trusted local host: raw input] --> Mask[LocalPrivacyClient / MaskingEngine]
+    Mask --> Payload[Masked payload]
+    Payload --> Provider[Provider callback]
+    Provider --> Response[Surrogate response]
+    Response --> Restore[Trusted local restoration]
+    Restore --> UI[Local user display]
+    Vault[SessionVault: mappings and operation locks] --- Mask
+    Vault --- Restore
 ```
 
-### Korean Agglutinative Morphology Engine (교착어 형태소 분리)
-In Korean, words (어절) bind substantive stems (체언) with grammatical particles (조사) and endings (어미):
+Only the callback argument crosses the provider boundary. The restored response is returned to
+the trusted host, never to an MCP tool result. MCP utilities are useful for already-public data;
+they do not intercept the host's outgoing prompts. The CLI refuses unauthenticated network transports.
 
-$$\text{어절} = \text{체언 (실질 형태소)} + \text{조사 (형식 형태소)}$$
+The tokenizer recognizes sensitive spans before splitting Unicode words. Modes determine whether
+content/function words are masked. English names use case heuristics; Korean and case-free names
+use conservative masking and explicit sensitive terms. Korean suffixes require stem evidence;
+ambiguous unknown words remain whole. No universal named entity or morphology guarantee is made.
 
-```mermaid
-sequenceDiagram
-    participant Text as "원문: 삼성전자가"
-    participant Engine as "KoreanGrammarEngine"
-    participant Vault as "Session Vault"
-    participant Output as "LLM 프롬프트"
+Code uses a small lexer with per-language keywords and opaque literal/comment bodies. Explicit
+language selection is preferable to heuristic detection. Code names and numeric expressions become
+`smcp_ID_n`/`smcp_LIT_n` and random native integer constants; they preserve review syntax,
+not execution or type semantics.
 
-    Text->>Engine: Analyze '삼성전자가'
-    Engine->>Engine: Longest-match josa extraction ('가')
-    Engine->>Engine: Stem: '삼성전자' (Entity), Suffix: '가' (Subject Josa)
-    Engine->>Vault: Check or create surrogate for '삼성전자'
-    Vault-->>Engine: Returns '[ENT_1]'
-    Engine->>Output: Concatenate surrogate + suffix -> '[ENT_1]가'
-```
+Mappings are keyed by context, type and original value. Restoration uses one substitution pass,
+so inserted originals cannot be restored a second time. Explicit delimiters disambiguate pseudowords.
+Unknown/altered candidates are reported and rejected in strict mode; arbitrary model edits are not
+recoverable. Korean allomorph normalization is a separate opt-in operation for generated text.
 
----
+Every engine allocation uses the generator's reentrant operation lock. Session clear acquires the
+same lock, waits for work and invalidates future operations. The vault lock protects the registry;
+lock order is vault then session. A daemon sweep releases idle expired mappings within the cleanup
+interval. Close stops the worker and clears references. Custom library store mutations require
+`session.operation()`. Clearing references is not physical memory zeroization.
 
-## 3. Code-Aware Obfuscation AST Engine
-
-When processing source code (Python, TypeScript, SQL, Rust, Go, Java, C++):
-- **Preserved Unchanged:**
-  - Control keywords: `def`, `class`, `function`, `return`, `if`, `else`, `async`, `await`, `SELECT`, `WHERE`, `JOIN`
-  - Built-in runtime symbols: `len`, `range`, `print`, `console.log`, `JSON.stringify`
-  - Operators & syntax: `{}`, `()`, `[]`, `=>`, `+`, `-`, `*`, `;`, `:`, `.`
-  - Indentation, newlines, and code structural geometry.
-- **Obfuscated:**
-  - Function / Method identifiers $\to$ `[ID_1]`
-  - Variable / Parameter identifiers $\to$ `[ID_2]`
-  - String literals $\to$ `"[LIT_1]"`
-  - Numeric constants $\to$ `[NUM_1]`
-
----
-
-## 4. Security & Privacy Guarantees
-
-1. **Zero Cloud Disclosures:** No original tokens, mapping entries, or session metadata ever leave the local host.
-2. **Volatile Memory Storage:** Mappings reside in Python process memory and are purged upon session termination or TTL expiration.
-3. **No External Network Dependencies:** SecureMCP requires no internet access to perform tokenization, grammar parsing, or masking.
+CLI transfer is opt-in authenticated encryption with random salt and a password KDF. Schema v2
+persists mappings and allocation counters without re-running the generator. Legacy v1 is read;
+unknown versions fail explicitly. A CLI transaction holds an exclusive lock file from load to save.
+Concurrent writes fail, atomic replacement prevents partial snapshots, and stale locks require
+operator inspection after a crash. Caller-owned standalone sessions have caller-owned lifetime.

@@ -1,14 +1,18 @@
-"""Core bi-directional semantic masking and unmasking engine for SecureMCP."""
+"""Local masking and exact, single-pass restoration."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import re
-from typing import Dict, List, Optional, Set, Tuple
 
-from secure_mcp.engine.code_parser import CodeParser
+from secure_mcp.engine.code_parser import CodeParser, detect_language, literal_parts
 from secure_mcp.engine.grammar_en import EnglishGrammarEngine
-from secure_mcp.engine.grammar_ko import KoreanGrammarEngine, is_hangul_string
-from secure_mcp.engine.strategies import StrategyGenerator
+from secure_mcp.engine.grammar_ko import (
+    KoreanGrammarEngine,
+    is_hangul_string,
+    normalize_particle,
+)
+from secure_mcp.engine.strategies import StrategyGenerator, mapping_key
 from secure_mcp.engine.tokenizer import MultilingualTokenizer, TextChunk
 from secure_mcp.models import (
     MaskMode,
@@ -19,274 +23,352 @@ from secure_mcp.models import (
     UnmaskResult,
 )
 
+STRUCTURAL_WORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "in",
+    "to",
+    "for",
+    "with",
+    "on",
+    "at",
+    "from",
+    "by",
+    "and",
+    "or",
+    "but",
+    "if",
+}
+STRUCTURAL_KO = {"그리고", "그러나", "및", "또는", "하지만"}
+
 
 class MaskingEngine:
-    """Zero-knowledge grammar-preserving masking and restoration engine."""
-
-    def __init__(self):
+    def __init__(self) -> None:
         self.en_grammar = EnglishGrammarEngine()
         self.ko_grammar = KoreanGrammarEngine()
         self.code_parser = CodeParser()
         self.tokenizer = MultilingualTokenizer()
+
+    @staticmethod
+    def _strategy(
+        generator: StrategyGenerator, requested: SurrogateStrategy | None
+    ) -> SurrogateStrategy:
+        if requested is not None and requested != generator.strategy:
+            raise ValueError("Requested strategy must match the generator's strategy.")
+        return generator.strategy
 
     def mask_text(
         self,
         text: str,
         session_id: str,
         generator: StrategyGenerator,
-        mapping_store: Dict[str, TokenMapping],
-        reverse_store: Dict[str, TokenMapping],
+        mapping_store: dict[str, TokenMapping],
+        reverse_store: dict[str, TokenMapping],
         mode: MaskMode = MaskMode.CONTENT_WORDS,
-        strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
-        custom_preserve: Optional[Set[str]] = None,
+        strategy: SurrogateStrategy | None = None,
+        custom_preserve: set[str] | None = None,
         language: str = "auto",
+        sensitive_terms: set[str] | None = None,
+        code_language: str = "auto",
     ) -> MaskResult:
-        """Mask non-grammatical content words while strictly preserving grammatical syntax."""
-        strategy = generator.strategy
-        if mode == MaskMode.CODE_AWARE:
-            return self.mask_code(
-                text, session_id, generator, mapping_store, reverse_store, strategy
-            )
-        custom_preserve = custom_preserve or set()
-        chunks = self.tokenizer.tokenize(text)
-
-        output_parts: List[str] = []
-        total_tokens = 0
-        masked_tokens = 0
-        preserved_tokens = 0
-
-        # Auto-detect language if needed
-        is_korean = (language == "ko") or (language == "auto" and is_hangul_string(text))
-
-        for i, chunk in enumerate(chunks):
-            if chunk.is_whitespace or chunk.is_punctuation:
-                output_parts.append(chunk.text)
-                continue
-
-            total_tokens += 1
-            word = chunk.text
-
-            # Handle atomic numbers and currencies ($43,000,000, 15.5%, etc.)
-            if chunk.is_number:
-                surrogate = self._get_or_create_surrogate(
-                    word, TokenType.NUMBER, generator, mapping_store, reverse_store
+        strategy = self._strategy(generator, strategy)
+        if language not in {"auto", "en", "ko"}:
+            raise ValueError("language must be auto, en, or ko")
+        with generator.operation():
+            if mode == MaskMode.CODE_AWARE:
+                return self.mask_code(
+                    text,
+                    session_id,
+                    generator,
+                    mapping_store,
+                    reverse_store,
+                    strategy,
+                    language=code_language,
                 )
-                output_parts.append(surrogate)
-                masked_tokens += 1
-                continue
-
-            # Check custom preserved terms
-            if word.lower() in custom_preserve or word in custom_preserve:
-                output_parts.append(word)
-                preserved_tokens += 1
-                continue
-
-            # Korean word processing
-            if is_korean and is_hangul_string(word):
-                stem, suffix, token_type = self.ko_grammar.decompose_token(word)
-
-                if token_type == TokenType.GRAMMAR or (mode == MaskMode.ENTITIES_ONLY and token_type != TokenType.ENTITY):
-                    output_parts.append(word)
-                    preserved_tokens += 1
+            terms = sensitive_terms or set()
+            preserve = {word.casefold() for word in (custom_preserve or set())}
+            chunks = self._chunks(text, terms)
+            output: list[str] = []
+            total = masked = 0
+            for chunk in chunks:
+                word = chunk.text
+                if chunk.is_whitespace or (
+                    not chunk.is_word and not chunk.is_code and chunk.kind != "ENTITY"
+                ):
+                    output.append(word)
                     continue
-
-                surrogate = self._get_or_create_surrogate(
-                    stem, token_type, generator, mapping_store, reverse_store
-                )
-                output_parts.append(surrogate + suffix)
-                masked_tokens += 1
-                continue
-
-            # English / Latin word processing
-            is_sentence_start = (i == 0 or (i > 1 and chunks[i - 2].text in (".", "!", "?", "\n")))
-            token_type, should_mask = self.en_grammar.classify_token(
-                word, is_sentence_start=is_sentence_start,
-                mask_sentence_initial_entities=(mode == MaskMode.ENTITIES_ONLY),
+                total += 1
+                stem, suffix = word, ""
+                force = chunk.kind in {
+                    "ENTITY",
+                    "EMAIL",
+                    "URL",
+                    "SECRET",
+                    "UUID",
+                    "IP",
+                    "PHONE",
+                    "CODE_BLOCK",
+                }
+                token_type = TokenType.ENTITY if force else TokenType.NOUN
+                should_mask = force
+                if chunk.is_number:
+                    token_type, should_mask = TokenType.NUMBER, True
+                elif not force and is_hangul_string(word):
+                    # Mixed Korean/English input is handled per token, even with language=en.
+                    known = terms | {m.original for m in mapping_store.values()}
+                    stem, suffix, token_type = self.ko_grammar.decompose_token(
+                        word, known
+                    )
+                    should_mask = token_type != TokenType.GRAMMAR
+                    # Case-free scripts have no reliable proper-name cue: mask conservatively.
+                    if (
+                        mode == MaskMode.ENTITIES_ONLY
+                        and should_mask
+                        and token_type != TokenType.NUMBER
+                    ):
+                        token_type = TokenType.ENTITY
+                    if mode == MaskMode.AGGRESSIVE and word not in STRUCTURAL_KO:
+                        stem, suffix, token_type, should_mask = (
+                            word,
+                            "",
+                            TokenType.NOUN,
+                            True,
+                        )
+                elif not force:
+                    token_type, should_mask = self.en_grammar.classify_token(word)
+                    if (
+                        any(ord(c) > 127 and c.isalpha() for c in word)
+                        and not word.isascii()
+                    ):
+                        if (
+                            mode == MaskMode.ENTITIES_ONLY
+                            and token_type != TokenType.GRAMMAR
+                        ):
+                            token_type, should_mask = TokenType.ENTITY, True
+                    if mode == MaskMode.ENTITIES_ONLY and token_type not in {
+                        TokenType.ENTITY,
+                        TokenType.NUMBER,
+                    }:
+                        should_mask = False
+                    if (
+                        mode == MaskMode.AGGRESSIVE
+                        and word.casefold() not in STRUCTURAL_WORDS
+                    ):
+                        should_mask = True
+                    if should_mask and word.endswith(("'s", "’s")):
+                        stem, suffix = word[:-2], word[-2:]
+                if word.casefold() in preserve and not force:
+                    should_mask = False
+                if should_mask:
+                    output.append(
+                        self._get_or_create_surrogate(
+                            stem, token_type, generator, mapping_store, reverse_store
+                        )
+                        + suffix
+                    )
+                    masked += 1
+                else:
+                    output.append(word)
+            return self._result(
+                "".join(output),
+                session_id,
+                total,
+                masked,
+                strategy,
+                mode,
+                "ko" if is_hangul_string(text) else "en",
             )
 
-            if not should_mask or (mode == MaskMode.ENTITIES_ONLY and token_type not in (TokenType.ENTITY, TokenType.NUMBER)):
-                output_parts.append(word)
-                preserved_tokens += 1
-                continue
-
-            # Handle possessives like Alice's -> [ENT_1]'s
-            possessive_suffix = ""
-            base_word = word
-            if "'" in word:
-                parts = word.split("'", 1)
-                base_word = parts[0]
-                possessive_suffix = "'" + parts[1]
-
-            surrogate = self._get_or_create_surrogate(
-                base_word, token_type, generator, mapping_store, reverse_store
-            )
-            output_parts.append(surrogate + possessive_suffix)
-            masked_tokens += 1
-
-        privacy_score = round(masked_tokens / max(1, total_tokens), 4)
-
-        return MaskResult(
-            masked_text="".join(output_parts),
-            session_id=session_id,
-            total_tokens=total_tokens,
-            masked_tokens=masked_tokens,
-            preserved_tokens=preserved_tokens,
-            privacy_entropy_score=privacy_score,
-            strategy=strategy,
-            mode=mode,
-            detected_language="ko" if is_korean else "en",
+    def _chunks(self, text: str, terms: set[str]) -> list[TextChunk]:
+        if not terms:
+            return self.tokenizer.tokenize(text)
+        if "" in terms:
+            raise ValueError("Sensitive terms must be nonempty.")
+        pattern = re.compile(
+            r"(?<!\w)(?:"
+            + "|".join(re.escape(s) for s in sorted(terms, key=len, reverse=True))
+            + r")(?!\w)"
         )
+        output: list[TextChunk] = []
+        cursor = 0
+        for match in pattern.finditer(text):
+            output.extend(self.tokenizer.tokenize(text[cursor : match.start()]))
+            output.append(TextChunk(match[0], "ENTITY"))
+            cursor = match.end()
+        output.extend(self.tokenizer.tokenize(text[cursor:]))
+        return output
 
     def mask_code(
         self,
         code: str,
         session_id: str,
         generator: StrategyGenerator,
-        mapping_store: Dict[str, TokenMapping],
-        reverse_store: Dict[str, TokenMapping],
-        strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
+        mapping_store: dict[str, TokenMapping],
+        reverse_store: dict[str, TokenMapping],
+        strategy: SurrogateStrategy | None = None,
+        language: str = "auto",
     ) -> MaskResult:
-        """Mask code identifiers and string literals while keeping keywords, operators, and syntax."""
-        strategy = generator.strategy
-        tokens = self.code_parser.tokenize(code)
-        output_parts: List[str] = []
-        total_tokens = 0
-        masked_tokens = 0
-        preserved_tokens = 0
-
-        for raw_val, token_type, subkind in tokens:
-            if subkind == "whitespace":
-                output_parts.append(raw_val)
-                continue
-
-            total_tokens += 1
-
-            if token_type == TokenType.GRAMMAR:
-                output_parts.append(raw_val)
-                preserved_tokens += 1
-            elif token_type == TokenType.IDENTIFIER:
-                surrogate = self._get_or_create_surrogate(
-                    raw_val, TokenType.IDENTIFIER, generator, mapping_store, reverse_store
-                )
-                output_parts.append(surrogate)
-                masked_tokens += 1
-            elif token_type == TokenType.LITERAL:
-                # Preserve delimiters/prefixes, but hide all literal content,
-                # including interpolated expressions and comment bodies.
-                if subkind == "comment":
-                    prefix = raw_val[:2] if raw_val.startswith(("//", "/*")) else "#"
-                    suffix = "*/" if prefix == "/*" else ""
+        strategy = self._strategy(generator, strategy)
+        language = detect_language(code, language)
+        with generator.operation():
+            tokens = self.code_parser.tokenize(code, language)
+            output: list[str] = []
+            total = masked = 0
+            for raw, token_type, subkind in tokens:
+                if subkind == "whitespace":
+                    output.append(raw)
+                    continue
+                if subkind == "syntax":
+                    output.append(raw)
+                    continue
+                total += 1
+                if token_type == TokenType.GRAMMAR:
+                    output.append(raw)
+                elif token_type == TokenType.LITERAL:
+                    prefix, suffix = literal_parts(raw, subkind)
+                    end = len(raw) - len(suffix) if suffix else len(raw)
+                    content = raw[len(prefix) : end]
+                    if content:
+                        surrogate = self._get_or_create_surrogate(
+                            content,
+                            token_type,
+                            generator,
+                            mapping_store,
+                            reverse_store,
+                            code=True,
+                        )
+                        output.append(prefix + surrogate + suffix)
+                        masked += 1
+                    else:
+                        output.append(raw)
                 else:
-                    match = re.match(r"[rRuUbBfF]*([\"']{3}|[\"'])", raw_val)
-                    if match is None:
-                        raise ValueError("Unsupported string literal")
-                    prefix = match.group()
-                    suffix = match.group(1)
-                end = len(raw_val) - len(suffix) if suffix else len(raw_val)
-                content = raw_val[len(prefix):end]
-                if content:
-                    surrogate = self._get_or_create_surrogate(
-                        content, TokenType.LITERAL, generator, mapping_store, reverse_store
+                    output.append(
+                        self._get_or_create_surrogate(
+                            raw,
+                            token_type,
+                            generator,
+                            mapping_store,
+                            reverse_store,
+                            code=True,
+                        )
                     )
-                    output_parts.append(prefix + surrogate + suffix)
-                    masked_tokens += 1
-                else:
-                    output_parts.append(raw_val)
-                    preserved_tokens += 1
-            elif token_type == TokenType.NUMBER:
-                surrogate = self._get_or_create_surrogate(
-                    raw_val, TokenType.NUMBER, generator, mapping_store, reverse_store
-                )
-                output_parts.append(surrogate)
-                masked_tokens += 1
-            else:
-                output_parts.append(raw_val)
-                preserved_tokens += 1
+                    masked += 1
+            result = self._result(
+                "".join(output),
+                session_id,
+                total,
+                masked,
+                strategy,
+                MaskMode.CODE_AWARE,
+                "code",
+            )
+            result.code_language = language
+            return result
 
-        privacy_score = round(masked_tokens / max(1, total_tokens), 4)
-
+    @staticmethod
+    def _result(
+        text: str,
+        sid: str,
+        total: int,
+        masked: int,
+        strategy: SurrogateStrategy,
+        mode: MaskMode,
+        language: str,
+    ) -> MaskResult:
         return MaskResult(
-            masked_text="".join(output_parts),
-            session_id=session_id,
-            total_tokens=total_tokens,
-            masked_tokens=masked_tokens,
-            preserved_tokens=preserved_tokens,
-            privacy_entropy_score=privacy_score,
+            masked_text=text,
+            session_id=sid,
+            total_tokens=total,
+            masked_tokens=masked,
+            preserved_tokens=total - masked,
+            privacy_entropy_score=round(masked / max(1, total), 4),
             strategy=strategy,
-            mode=MaskMode.CODE_AWARE,
-            detected_language="code",
+            mode=mode,
+            detected_language=language,
         )
 
     def unmask(
         self,
         masked_text: str,
         session_id: str,
-        reverse_store: Dict[str, TokenMapping],
+        reverse_store: dict[str, TokenMapping],
         strategy: SurrogateStrategy = SurrogateStrategy.BRACKET,
+        normalize_particles: bool = False,
+        strict: bool = False,
     ) -> UnmaskResult:
-        """Restore original text by substituting synthetic surrogate tokens with original values."""
-        if not reverse_store:
+        generator = getattr(reverse_store, "generator", None)
+        guard = generator.operation() if generator else nullcontext()
+        with guard:
+            sorted_values = sorted(reverse_store, key=len, reverse=True)
+            alternatives = []
+            for value in sorted_values:
+                escaped = re.escape(value)
+                if value[0].isalnum():
+                    escaped = r"(?<![A-Za-z0-9_])" + escaped + r"(?![A-Za-z0-9_])"
+                alternatives.append(escaped)
+            count = 0
+            unique: set[str] = set()
+
+            def restore(match: re.Match[str]) -> str:
+                nonlocal count
+                count += 1
+                key = match[1] if normalize_particles else match[0]
+                mapping = reverse_store[key]
+                unique.add(key)
+                suffix = match[2] or "" if normalize_particles else ""
+                return mapping.original + (
+                    normalize_particle(mapping.original, suffix) if suffix else ""
+                )
+
+            output = masked_text
+            if alternatives:
+                pattern = "|".join(alternatives)
+                if normalize_particles:
+                    pattern = (
+                        "("
+                        + pattern
+                        + r")((?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
+                    )
+                output = re.sub(pattern, restore, masked_text)
+            candidates = StrategyGenerator.get_pattern(strategy).findall(masked_text)
+            unmatched = sorted({c for c in candidates if c not in reverse_store})
+            if strict and unmatched:
+                raise ValueError(
+                    "Unrecognized or altered surrogate tokens: " + ", ".join(unmatched)
+                )
             return UnmaskResult(
-                unmasked_text=masked_text,
+                unmasked_text=output,
                 session_id=session_id,
-                restored_tokens_count=0,
-                unmatched_surrogates=[],
+                restored_tokens_count=count,
+                restored_unique_tokens=len(unique),
+                unmatched_surrogates=unmatched,
             )
-
-        # Sort surrogates longest first to prevent prefix substitution collisions
-        sorted_surrogates = sorted(reverse_store.keys(), key=len, reverse=True)
-        restored_count = 0
-        alternatives = []
-        for surrogate in sorted_surrogates:
-            escaped = re.escape(surrogate)
-            if surrogate[0].isalnum():
-                # ASCII boundaries allow Korean particles attached to a surrogate.
-                escaped = r"(?<![A-Za-z0-9_])" + escaped + r"(?![A-Za-z0-9_])"
-            alternatives.append(escaped)
-
-        def restore(match: re.Match) -> str:
-            nonlocal restored_count
-            restored_count += 1
-            return reverse_store[match.group()].original
-
-        restored_text = re.sub("|".join(alternatives), restore, masked_text)
-
-        # Scan for any orphan surrogate tokens left in text
-        pattern = StrategyGenerator.get_pattern(strategy)
-        remaining = pattern.findall(masked_text)
-        unmatched = [tok for tok in remaining if tok not in reverse_store]
-
-        return UnmaskResult(
-            unmasked_text=restored_text,
-            session_id=session_id,
-            restored_tokens_count=restored_count,
-            unmatched_surrogates=list(set(unmatched)),
-        )
 
     def _get_or_create_surrogate(
         self,
         original_token: str,
         token_type: TokenType,
         generator: StrategyGenerator,
-        mapping_store: Dict[str, TokenMapping],
-        reverse_store: Dict[str, TokenMapping],
+        mapping_store: dict[str, TokenMapping],
+        reverse_store: dict[str, TokenMapping],
+        code: bool = False,
     ) -> str:
-        """Lookup existing surrogate or generate a deterministic new one."""
-        key = original_token
-        if key in mapping_store:
-            mapping = mapping_store[key]
-            mapping.occurrence_count += 1
-            return mapping.surrogate
-
-        surrogate = generator.generate(token_type, key)
-        mapping = TokenMapping(
-            original=key,
-            surrogate=surrogate,
-            token_type=token_type,
-            occurrence_count=1,
-            is_capitalized=key.istitle(),
-            is_all_caps=key.isupper() and len(key) > 1,
-        )
-        mapping_store[key] = mapping
-        reverse_store[surrogate] = mapping
-        return surrogate
+        with generator.operation():
+            key = mapping_key(original_token, token_type, code)
+            if key in mapping_store:
+                mapping_store[key].occurrence_count += 1
+                return mapping_store[key].surrogate
+            surrogate = generator.generate(token_type, original_token, code=code)
+            mapping = TokenMapping(
+                original=original_token,
+                surrogate=surrogate,
+                token_type=token_type,
+                context="code" if code else "text",
+                is_capitalized=original_token.istitle(),
+                is_all_caps=original_token.isupper() and len(original_token) > 1,
+            )
+            mapping_store[key] = mapping
+            reverse_store[surrogate] = mapping
+            return surrogate

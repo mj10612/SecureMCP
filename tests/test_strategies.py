@@ -1,6 +1,5 @@
 """Tests for surrogate token generation strategies."""
 
-import pytest
 from secure_mcp.engine.strategies import StrategyGenerator
 from secure_mcp.models import SurrogateStrategy, TokenType
 
@@ -34,8 +33,8 @@ def test_pseudoword_strategy():
     s1 = gen.generate(TokenType.ENTITY, "Apple")
     s2 = gen.generate(TokenType.NOUN, "Computer")
     assert s1 != s2
-    assert s1[0].isupper()
-    assert s2[0].isupper()
+    assert s1[1:-1].isalpha() and s1.startswith("⟪") and s1.endswith("⟫")
+    assert s2[1:-1].isalpha() and s2.startswith("⟪") and s2.endswith("⟫")
 
 
 def test_hash_strategy():

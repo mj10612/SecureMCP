@@ -1,43 +1,31 @@
-"""Example demonstrating privacy-preserving Anthropic Claude API interaction with SecureMCP."""
+"""Korean trusted-host pipeline demo. The callback receives only the masked text."""
 
-import os
-from secure_mcp import MaskingEngine, SessionVault, MaskMode, SurrogateStrategy
+import sys
 
-# In a real environment, you would use:
-# import anthropic
-# client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+from secure_mcp import LocalPrivacyClient, SurrogateStrategy
+
 
 def run_claude_privacy_pipeline():
-    vault = SessionVault()
-    engine = MaskingEngine()
-    session = vault.get_or_create("claude_session", mode=MaskMode.CONTENT_WORDS, strategy=SurrogateStrategy.UNICODE)
+    text = "네이버 클라우드가 카카오페이와 연계하여 150억원의 신규 결제 보안 인프라를 구축하기로 합의했습니다."
 
-    korean_text = "네이버 클라우드가 카카오페이와 연계하여 150억원의 신규 결제 보안 인프라를 구축하기로 합의했습니다."
-    print("=" * 60)
-    print("1. KOREAN ORIGINAL TEXT:")
-    print(korean_text)
+    def simulated_provider(masked_payload):
+        print("MASKED:", masked_payload)
+        return masked_payload
 
-    mask_res = engine.mask_text(
-        text=korean_text,
-        session_id=session.session_id,
-        generator=session.generator,
-        mapping_store=session.forward_store,
-        reverse_store=session.reverse_store,
-        strategy=SurrogateStrategy.UNICODE,
-        language="ko"
-    )
-    print("\n2. OBFUSCATED PAYLOAD SENT TO CLAUDE (Syntax/조사 Preserved):")
-    print(mask_res.masked_text)
+    with LocalPrivacyClient() as client:
+        result = client.request(
+            text,
+            simulated_provider,
+            strategy=SurrogateStrategy.UNICODE,
+            language="ko",
+            sensitive_terms={"네이버", "카카오페이"},
+        )
+        assert result.unmasked_text == text
+        print("RESTORED:", result.unmasked_text)
+        return result.unmasked_text
 
-    # Simulated Claude response
-    claude_reply = "⟦ENT_1⟧와 ⟦ENT_2⟧ 간의 ⟦NOUN_1⟧ 구축 합의는 ⟦NUM_1⟧ 규모의 대형 ⟦NOUN_2⟧ 프로젝트로 평가됩니다."
-    print("\n3. CLAUDE RESPONSE WITH UNICODE SURROGATES:")
-    print(claude_reply)
-
-    restored = engine.unmask(claude_reply, session.session_id, session.reverse_store, strategy=SurrogateStrategy.UNICODE)
-    print("\n4. RESTORED RESPONSE ON CLIENT:")
-    print(restored.unmasked_text)
-    print("=" * 60)
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     run_claude_privacy_pipeline()

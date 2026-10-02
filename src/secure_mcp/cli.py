@@ -1,312 +1,282 @@
-"""Command-Line Interface (CLI) for SecureMCP."""
+"""Trusted local CLI with opt-in encrypted session transfer."""
 
 from __future__ import annotations
 
-import json
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 import sys
 import time
-from pathlib import Path
+
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
+from rich.text import Text
 
-from secure_mcp.server import app, engine, vault
+from secure_mcp.encrypted_session import load_session, save_session, session_file_lock
 from secure_mcp.models import MaskMode, SurrogateStrategy
-from secure_mcp.encrypted_session import load_session, save_session
+from secure_mcp.server import app, engine, vault
 from secure_mcp.session import PrivacySession
+
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+console = Console(legacy_windows=False)
 
 
 class LiteralArgumentGroup(click.Group):
-    """Keep user text literal, including hash surrogates starting with '~'."""
-
     def main(self, *args, **kwargs):
         kwargs["windows_expand_args"] = False
         return super().main(*args, **kwargs)
 
 
-def _session_file_options(command):
+def _file_options(command):
     command = click.option(
-        "--session-file", type=click.Path(dir_okay=False, path_type=Path),
-        help="Opt in to a password-encrypted mapping file for separate CLI invocations.",
+        "--session-file", type=click.Path(dir_okay=False, path_type=Path)
     )(command)
     return click.option(
-        "--session-password", envvar="SECURE_MCP_SESSION_PASSWORD", hide_input=True,
-        help="Encryption password (prefer the environment variable or hidden prompt).",
+        "--session-password", envvar="SECURE_MCP_SESSION_PASSWORD", hide_input=True
     )(command)
-
-
-def _password(value):
-    return value or click.prompt("Session file password", hide_input=True)
 
 
 def _check_strategy(session, strategy):
     if session.strategy != strategy:
-        raise click.ClickException(
-            f"Session uses strategy '{session.strategy.value}'; use a new session ID/file "
-            f"to switch to '{strategy.value}'."
+        raise ValueError(
+            f"Session uses strategy '{session.strategy.value}'; use a new session ID/file to switch to '{strategy.value}'."
         )
 
-# Ensure UTF-8 output on Windows terminals
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
-console = Console(legacy_windows=False)
+@contextmanager
+def _session(sid, path, password, mode=None, strategy=None):
+    try:
+        session: PrivacySession | None
+        with session_file_lock(path) if path else nullcontext():
+            if path:
+                password = password or click.prompt(
+                    "Session file password", hide_input=True
+                )
+                if path.exists():
+                    session = load_session(path, password, sid)
+                elif mode is not None:
+                    session = PrivacySession(sid, mode, strategy)
+                else:
+                    raise ValueError("Encrypted session file does not exist.")
+            else:
+                session = (
+                    vault.get_or_create(sid, mode, strategy)
+                    if mode is not None
+                    else vault.get_session(sid)
+                )
+            if session is None:
+                raise ValueError(
+                    f"Session '{sid}' not found. For separate CLI invocations, pass the same --session-file to both mask and unmask."
+                )
+            if strategy is not None:
+                _check_strategy(session, strategy)
+            try:
+                with session.operation():
+                    yield session
+                    if path:
+                        save_session(path, session, password)
+            finally:
+                if path:
+                    session.clear()
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.1.0")
+@click.version_option(version="0.2.0")
 def main():
-    """SecureMCP: Grammar-Preserving Zero-Knowledge Semantic Masking & Anonymization for LLMs."""
-    pass
+    """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 
 
 @main.command()
-@click.option(
-    "--transport",
-    type=click.Choice(["stdio", "sse", "streamable-http"], case_sensitive=False),
-    default="stdio",
-    help="MCP transport protocol (stdio for local clients like Claude Desktop/Cursor, sse for remote).",
-)
-@click.option("--host", default="127.0.0.1", help="Host to bind for HTTP/SSE transport.")
-@click.option("--port", default=8000, type=int, help="Port to bind for HTTP/SSE transport.")
-def serve(transport: str, host: str, port: int):
-    """Start the SecureMCP server to listen for tool calls from Claude Desktop, Cursor, or AI agents."""
-    transport_lower = transport.lower()
-    if transport_lower != "stdio":
-        console.print(f"[bold green]Starting SecureMCP server on {host}:{port} via {transport_lower}...[/bold green]")
-        app.run(transport=transport_lower, host=host, port=port)
-    else:
-        # stdio runs silently so as not to corrupt JSON-RPC protocol messages
-        app.run(transport="stdio")
+@click.option("--transport", type=click.Choice(["stdio"]), default="stdio")
+def serve(transport):
+    """Run local MCP utilities. Network transports are disabled without authentication."""
+    try:
+        app.run(transport=transport)
+    finally:
+        vault.close()
 
 
 @main.command()
 @click.argument("text")
-@click.option("--session-id", default="cli_session", help="Session ID for mapping isolation.")
+@click.option("--session-id", default="cli_session")
 @click.option(
-    "--mode",
-    type=click.Choice(["content_words", "entities_only", "code_aware", "aggressive"]),
-    default="content_words",
-    help="Masking policy.",
+    "--mode", type=click.Choice([m.value for m in MaskMode]), default="content_words"
 )
 @click.option(
     "--strategy",
-    type=click.Choice(["bracket", "unicode", "pseudoword", "hash"]),
+    type=click.Choice([s.value for s in SurrogateStrategy]),
     default="bracket",
-    help="Surrogate token strategy.",
 )
-@click.option("--language", default="auto", help="Language ('auto', 'en', 'ko').")
-@_session_file_options
-def mask(text: str, session_id: str, mode: str, strategy: str, language: str,
-         session_file: Path | None, session_password: str | None):
-    """Mask text using grammar-preserving token obfuscation."""
-    strat = SurrogateStrategy(strategy)
-    mask_mode = MaskMode(mode)
-    try:
-        if session_file is not None:
-            session_password = _password(session_password)
-            if session_file.exists():
-                session = load_session(session_file, session_password, session_id)
-                _check_strategy(session, strat)
-            else:
-                session = PrivacySession(session_id, mode=mask_mode, strategy=strat)
-        else:
-            session = vault.get_or_create(session_id, mode=mask_mode, strategy=strat)
-    except (ValueError, OSError) as exc:
-        raise click.ClickException(str(exc)) from None
-    session.total_mask_calls += 1
-
-    res = engine.mask_text(
-        text=text,
-        session_id=session.session_id,
-        generator=session.generator,
-        mapping_store=session.forward_store,
-        reverse_store=session.reverse_store,
-        mode=mask_mode,
-        strategy=strat,
-        language=language,
-    )
-
-    if session_file is not None:
-        try:
-            save_session(session_file, session, session_password)
-        except (ValueError, OSError) as exc:
-            raise click.ClickException(str(exc)) from None
-
-    console.print(Panel(text, title="[cyan]Original Input[/cyan]", border_style="blue"))
-    console.print(Panel(res.masked_text, title="[green]Masked Output (Safe for LLM)[/green]", border_style="green"))
-
-    table = Table(title="Privacy & Token Metrics", show_header=True)
-    table.add_column("Metric", style="bold")
-    table.add_column("Value", style="yellow")
-    table.add_row("Session ID", res.session_id)
-    table.add_row("Detected Language", res.detected_language)
-    table.add_row("Total Tokens", str(res.total_tokens))
-    table.add_row("Masked Content Tokens", str(res.masked_tokens))
-    table.add_row("Preserved Grammar Tokens", str(res.preserved_tokens))
-    table.add_row("Privacy Obfuscation Score", f"{res.privacy_entropy_score * 100:.1f}%")
-    console.print(table)
+@click.option("--language", type=click.Choice(["auto", "en", "ko"]), default="auto")
+@click.option("--code-language", default="auto")
+@click.option("--sensitive-term", multiple=True)
+@click.option("--preserve", multiple=True)
+@click.option("--json-output", is_flag=True)
+@_file_options
+def mask(
+    text,
+    session_id,
+    mode,
+    strategy,
+    language,
+    code_language,
+    sensitive_term,
+    preserve,
+    json_output,
+    session_file,
+    session_password,
+):
+    """Mask locally; --json-output emits the masked payload without displaying raw input."""
+    mask_mode, strat = MaskMode(mode), SurrogateStrategy(strategy)
+    with _session(
+        session_id, session_file, session_password, mask_mode, strat
+    ) as session:
+        result = engine.mask_text(
+            text,
+            session.session_id,
+            session.generator,
+            session.forward_store,
+            session.reverse_store,
+            mode=mask_mode,
+            language=language,
+            code_language=code_language,
+            sensitive_terms=set(sensitive_term),
+            custom_preserve=set(preserve),
+        )
+        session.mode = mask_mode
+        session.total_mask_calls += 1
+    if json_output:
+        click.echo(result.model_dump_json())
+    else:
+        console.print(Panel(Text(text), title="Original Input"))
+        console.print(Panel(Text(result.masked_text), title="Masked Output"))
+        console.print(f"Masked occurrence ratio: {result.masked_ratio:.1%}")
 
 
 @main.command()
 @click.argument("masked_text")
-@click.option("--session-id", default="cli_session", help="Session ID matching the mask operation.")
+@click.option("--session-id", default="cli_session")
 @click.option(
-    "--strategy",
-    type=click.Choice(["bracket", "unicode", "pseudoword", "hash"]),
-    default=None,
-    help="Surrogate token strategy.",
+    "--strategy", type=click.Choice([s.value for s in SurrogateStrategy]), default=None
 )
-@_session_file_options
-def unmask(masked_text: str, session_id: str, strategy: str | None,
-           session_file: Path | None, session_password: str | None):
-    """Restore original tokens from an AI-generated response."""
-    try:
-        if session_file is not None:
-            session_password = _password(session_password)
-            session = load_session(session_file, session_password, session_id)
-        else:
-            session = vault.get_session(session_id)
-    except (ValueError, OSError) as exc:
-        raise click.ClickException(str(exc)) from None
-    if not session:
-        raise click.ClickException(
-            f"Session '{session_id}' not found. For separate CLI invocations, "
-            "pass the same --session-file to both mask and unmask."
+@click.option(
+    "--normalize-particles",
+    is_flag=True,
+    help="Adjust Korean particles in generated responses; off for exact roundtrips.",
+)
+@click.option("--strict", is_flag=True)
+@click.option("--json-output", is_flag=True)
+@_file_options
+def unmask(
+    masked_text,
+    session_id,
+    strategy,
+    normalize_particles,
+    strict,
+    json_output,
+    session_file,
+    session_password,
+):
+    """Restore for local display. Never send this output back into the model context."""
+    strat = SurrogateStrategy(strategy) if strategy is not None else None
+    with _session(
+        session_id, session_file, session_password, strategy=strat
+    ) as session:
+        result = engine.unmask(
+            masked_text,
+            session.session_id,
+            session.reverse_store,
+            strat or session.strategy,
+            normalize_particles,
+            strict,
         )
-
-    strat = SurrogateStrategy(strategy) if strategy is not None else session.strategy
-    _check_strategy(session, strat)
-    session.total_unmask_calls += 1
-    res = engine.unmask(
-        masked_text=masked_text,
-        session_id=session.session_id,
-        reverse_store=session.reverse_store,
-        strategy=strat,
-    )
-
-    if session_file is not None:
-        try:
-            save_session(session_file, session, session_password)
-        except (ValueError, OSError) as exc:
-            raise click.ClickException(str(exc)) from None
-
-    console.print(Panel(masked_text, title="[yellow]Masked AI Output[/yellow]", border_style="yellow"))
-    console.print(Panel(res.unmasked_text, title="[bold green]Restored Original Text[/bold green]", border_style="green"))
-    console.print(f"[bold cyan]Restored Tokens:[/bold cyan] {res.restored_tokens_count}")
+        session.total_unmask_calls += 1
+    if json_output:
+        click.echo(result.model_dump_json())
+    else:
+        console.print(Panel(Text(result.unmasked_text), title="Restored Original Text"))
+        console.print(
+            f"Restored occurrences: {result.restored_occurrences}; unique tokens: {result.restored_unique_tokens}"
+        )
+        if result.unmatched_surrogates:
+            console.print(
+                Text(
+                    "Unrecognized placeholders: "
+                    + ", ".join(result.unmatched_surrogates)
+                )
+            )
 
 
 @main.command()
 def demo():
-    """Run an interactive demonstration of English, Korean, and Code semantic masking."""
-    console.print(Panel.fit(
-        "[bold cyan]SecureMCP Demonstration[/bold cyan]\n"
-        "Zero-Knowledge Grammar-Preserving Semantic Masking for OpenAI & Claude",
-        border_style="cyan"
-    ))
-
-    # Demo 1: English M&A / Corporate
-    en_input = "Yesterday, Pfizer announced a $43,000,000 acquisition of Seagen to accelerate oncology drug development."
-    session_en = vault.get_or_create("demo_en", mode=MaskMode.CONTENT_WORDS, strategy=SurrogateStrategy.BRACKET)
-    res_en = engine.mask_text(
-        en_input, "demo_en", session_en.generator, session_en.forward_store, session_en.reverse_store
-    )
-
-    console.print("\n[bold yellow]=== 1. English Enterprise Data Masking ===[/bold yellow]")
-    console.print(f"[bold]Original:[/bold] {en_input}")
-    console.print(f"[bold green]Masked to LLM:[/bold green] {res_en.masked_text}")
-
-    # Simulated LLM response
-    sim_ai_en = f"The strategic acquisition of [ENT_2] by [ENT_1] for [NUM_1] enhances their capabilities in [NOUN_2] [NOUN_3]."
-    console.print(f"[bold blue]Simulated LLM Response:[/bold blue] {sim_ai_en}")
-
-    restored_en = engine.unmask(sim_ai_en, "demo_en", session_en.reverse_store)
-    console.print(f"[bold magenta]Restored on Client:[/bold magenta] {restored_en.unmasked_text}")
-
-    # Demo 2: Korean Agglutinative Preservation
-    ko_input = "삼성전자가 카카오와 협력하여 차세대 보안 AI 플랫폼을 개발하기로 계약을 체결했습니다."
-    session_ko = vault.get_or_create("demo_ko", mode=MaskMode.CONTENT_WORDS, strategy=SurrogateStrategy.UNICODE)
-    res_ko = engine.mask_text(
-        ko_input, "demo_ko", session_ko.generator, session_ko.forward_store, session_ko.reverse_store,
-        strategy=SurrogateStrategy.UNICODE, language="ko"
-    )
-
-    console.print("\n[bold yellow]=== 2. Korean Grammar (조사/어미) Preservation Masking ===[/bold yellow]")
-    console.print(f"[bold]Original:[/bold] {ko_input}")
-    console.print(f"[bold green]Masked to LLM:[/bold green] {res_ko.masked_text}")
-
-    sim_ai_ko = f"⟦ENT_1⟧와 ⟦ENT_2⟧의 협력 체결은 ⟦NOUN_2⟧ 분야에서 혁신적인 성과를 낼 것으로 기대됩니다."
-    console.print(f"[bold blue]Simulated LLM Response:[/bold blue] {sim_ai_ko}")
-
-    restored_ko = engine.unmask(sim_ai_ko, "demo_ko", session_ko.reverse_store, strategy=SurrogateStrategy.UNICODE)
-    console.print(f"[bold magenta]Restored on Client:[/bold magenta] {restored_ko.unmasked_text}")
-
-    # Demo 3: Code Obfuscation
-    code_input = """def calculate_credit_score(user_account, transaction_history):
-    base_rating = 750
-    if len(transaction_history) > 10:
-        return base_rating + 50
-    return base_rating"""
-    session_code = vault.get_or_create("demo_code", mode=MaskMode.CODE_AWARE, strategy=SurrogateStrategy.BRACKET)
-    res_code = engine.mask_code(
-        code_input, "demo_code", session_code.generator, session_code.forward_store, session_code.reverse_code_store if hasattr(session_code, 'reverse_code_store') else session_code.reverse_store
-    )
-
-    console.print("\n[bold yellow]=== 3. Proprietary Source Code Obfuscation ===[/bold yellow]")
-    console.print(Panel(code_input, title="Raw Code", border_style="red"))
-    console.print(Panel(res_code.masked_text, title="Masked Code (Keywords & Syntax Preserved)", border_style="green"))
-
-    restored_code = engine.unmask(res_code.masked_text, "demo_code", session_code.reverse_store)
-    console.print(f"[bold green]Restoration Verification:[/bold green] {'100% Identical' if restored_code.unmasked_text == code_input else 'Mismatch'}")
+    """Show exact local roundtrips using actual allocations, with no invented response IDs."""
+    samples = [
+        (
+            "Patient John Doe received 50mg at St. Jude Hospital.",
+            MaskMode.CONTENT_WORDS,
+        ),
+        (
+            "삼성전자가 카카오와 150억원의 보안 인프라를 구축합니다.",
+            MaskMode.CONTENT_WORDS,
+        ),
+        ("def 고객조회(고객번호):\n    return 고객번호 + 50", MaskMode.CODE_AWARE),
+    ]
+    for i, (text, mode) in enumerate(samples):
+        session = vault.create(f"demo_{time.time_ns()}_{i}", mode)
+        try:
+            masked = engine.mask_text(
+                text,
+                session.session_id,
+                session.generator,
+                session.forward_store,
+                session.reverse_store,
+                mode=mode,
+            )
+            restored = engine.unmask(
+                masked.masked_text, session.session_id, session.reverse_store
+            )
+            assert restored.unmasked_text == text
+            console.print(Panel(Text(masked.masked_text), title="Masked payload"))
+            console.print(
+                Panel(Text(restored.unmasked_text), title="Local restoration")
+            )
+        finally:
+            vault.clear_session(session.session_id)
 
 
 @main.command()
 def benchmark():
-    """Run performance throughput and entropy verification benchmarks."""
-    console.print("[bold cyan]Running SecureMCP Performance & Privacy Benchmark...[/bold cyan]\n")
-
-    sample_text = (
-        "In modern enterprise cloud architectures, Snowflake database instances process confidential financial records. "
-        "Engineers at Microsoft collaborate with OpenAI researchers to optimize transformer attention layers without exposing "
-        "proprietary patient health information or banking credentials."
-    ) * 50  # ~2,000 words
-
-    session = vault.get_or_create("bench_session")
-
-    # Masking Benchmark
-    start_t = time.perf_counter()
-    res = engine.mask_text(
-        sample_text, "bench_session", session.generator, session.forward_store, session.reverse_store
-    )
-    mask_duration = time.perf_counter() - start_t
-
-    # Unmasking Benchmark
-    start_t = time.perf_counter()
-    unmask_res = engine.unmask(res.masked_text, "bench_session", session.reverse_store)
-    unmask_duration = time.perf_counter() - start_t
-
-    words_processed = len(sample_text.split())
-    mask_throughput = words_processed / max(0.0001, mask_duration)
-    unmask_throughput = words_processed / max(0.0001, unmask_duration)
-
-    table = Table(title="Benchmark Results", show_header=True)
-    table.add_column("Benchmark Metric", style="bold")
-    table.add_column("Value", style="green")
-
-    table.add_row("Total Words Processed", f"{words_processed:,} words")
-    table.add_row("Masking Time", f"{mask_duration * 1000:.2f} ms")
-    table.add_row("Masking Speed", f"{mask_throughput:,.0f} words/sec")
-    table.add_row("Unmasking Time", f"{unmask_duration * 1000:.2f} ms")
-    table.add_row("Unmasking Speed", f"{unmask_throughput:,.0f} words/sec")
-    table.add_row("Privacy Obfuscation Ratio", f"{res.privacy_entropy_score * 100:.1f}%")
-    table.add_row("Roundtrip Restoration Accuracy", "100.0% (Zero Divergence)" if unmask_res.unmasked_text == sample_text else "Discrepancy Detected")
-
-    console.print(table)
+    """Measure this machine's throughput; masking ratio is not a privacy guarantee."""
+    text = "The engineers at Microsoft protect patient records with SecureMCP. " * 50
+    session = vault.create(f"bench_{time.time_ns()}")
+    try:
+        started = time.perf_counter()
+        masked = engine.mask_text(
+            text,
+            session.session_id,
+            session.generator,
+            session.forward_store,
+            session.reverse_store,
+        )
+        elapsed = time.perf_counter() - started
+        restored = engine.unmask(
+            masked.masked_text, session.session_id, session.reverse_store
+        )
+        console.print(
+            f"Benchmark Results: {len(text.split()) / max(elapsed, 0.0001):,.0f} words/sec"
+        )
+        console.print(
+            "100.0% (Zero Divergence)"
+            if restored.unmasked_text == text
+            else "Discrepancy Detected"
+        )
+    finally:
+        vault.clear_session(session.session_id)
 
 
 if __name__ == "__main__":

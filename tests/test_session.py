@@ -1,9 +1,8 @@
 """Tests for SessionVault and PrivacySession isolation and safety."""
 
 import time
-import pytest
 from secure_mcp.session import SessionVault
-from secure_mcp.models import MaskMode, SurrogateStrategy, TokenType
+from secure_mcp.models import TokenType
 
 
 def test_session_creation_and_isolation():
@@ -46,10 +45,9 @@ def test_session_sanitized_stats():
     gen = sess.generator
     surrogate = gen.generate(TokenType.ENTITY, "ConfidentialClient")
     from secure_mcp.models import TokenMapping
+
     sess.forward_store["ConfidentialClient"] = TokenMapping(
-        original="ConfidentialClient",
-        surrogate=surrogate,
-        token_type=TokenType.ENTITY
+        original="ConfidentialClient", surrogate=surrogate, token_type=TokenType.ENTITY
     )
 
     stats = sess.get_stats()

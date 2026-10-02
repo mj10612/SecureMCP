@@ -5,59 +5,238 @@ from __future__ import annotations
 import re
 from typing import Set, Tuple
 from secure_mcp.models import TokenType
+from secure_mcp.engine.tokenizer import (
+    SECRET_PATTERN,
+    PHONE_PATTERN,
+    IP_PATTERN,
+    UUID_PATTERN,
+)
 
 
 # Comprehensive closed-class English grammatical words
 CLOSED_CLASS_WORDS: Set[str] = {
     # Determiners & Articles
-    "a", "an", "the", "this", "that", "these", "those", "every", "each", "any",
-    "some", "all", "no", "neither", "either", "both", "another", "such", "much",
-    "many", "few", "fewer", "several", "enough", "other",
-
+    "a",
+    "an",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "every",
+    "each",
+    "any",
+    "some",
+    "all",
+    "no",
+    "neither",
+    "either",
+    "both",
+    "another",
+    "such",
+    "much",
+    "many",
+    "few",
+    "fewer",
+    "several",
+    "enough",
+    "other",
     # Prepositions (Comprehensive)
-    "of", "in", "to", "for", "with", "on", "at", "from", "by", "about", "as",
-    "into", "like", "through", "after", "over", "between", "out", "against",
-    "during", "without", "before", "under", "around", "among", "across",
-    "throughout", "towards", "toward", "upon", "within", "along", "down",
-    "behind", "beyond", "beside", "near", "off", "onto", "since", "until",
-    "via", "past", "amid", "beneath", "up", "regarding", "concerning",
-    "despite", "except",
-
+    "of",
+    "in",
+    "to",
+    "for",
+    "with",
+    "on",
+    "at",
+    "from",
+    "by",
+    "about",
+    "as",
+    "into",
+    "like",
+    "through",
+    "after",
+    "over",
+    "between",
+    "out",
+    "against",
+    "during",
+    "without",
+    "before",
+    "under",
+    "around",
+    "among",
+    "across",
+    "throughout",
+    "towards",
+    "toward",
+    "upon",
+    "within",
+    "along",
+    "down",
+    "behind",
+    "beyond",
+    "beside",
+    "near",
+    "off",
+    "onto",
+    "since",
+    "until",
+    "via",
+    "past",
+    "amid",
+    "beneath",
+    "up",
+    "regarding",
+    "concerning",
+    "despite",
+    "except",
     # Conjunctions
-    "and", "but", "or", "nor", "so", "yet", "because", "although", "though",
-    "while", "whereas", "if", "unless", "since", "until", "whether", "than",
-    "whenever", "wherever", "once",
-
+    "and",
+    "but",
+    "or",
+    "nor",
+    "so",
+    "yet",
+    "because",
+    "although",
+    "though",
+    "while",
+    "whereas",
+    "if",
+    "unless",
+    "since",
+    "until",
+    "whether",
+    "than",
+    "whenever",
+    "wherever",
+    "once",
     # Pronouns & Reflexives
-    "i", "me", "my", "mine", "myself", "you", "your", "yours", "yourself",
-    "yourselves", "he", "him", "his", "himself", "she", "her", "hers",
-    "herself", "it", "its", "itself", "we", "us", "our", "ours", "ourselves",
-    "they", "them", "their", "theirs", "themselves", "who", "whom", "whose",
-    "which", "what", "whatever", "whoever", "whomever", "someone", "anyone",
-    "everyone", "no one", "nobody", "somebody", "anybody", "something",
-    "anything", "everything", "nothing", "one", "ones",
-
+    "i",
+    "me",
+    "my",
+    "mine",
+    "myself",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+    "he",
+    "him",
+    "his",
+    "himself",
+    "she",
+    "her",
+    "hers",
+    "herself",
+    "it",
+    "its",
+    "itself",
+    "we",
+    "us",
+    "our",
+    "ours",
+    "ourselves",
+    "they",
+    "them",
+    "their",
+    "theirs",
+    "themselves",
+    "who",
+    "whom",
+    "whose",
+    "which",
+    "what",
+    "whatever",
+    "whoever",
+    "whomever",
+    "someone",
+    "anyone",
+    "everyone",
+    "no one",
+    "nobody",
+    "somebody",
+    "anybody",
+    "something",
+    "anything",
+    "everything",
+    "nothing",
+    "one",
+    "ones",
     # Auxiliary & Modal Verbs
-    "is", "am", "are", "was", "were", "be", "being", "been",
-    "have", "has", "had", "having",
-    "do", "does", "did", "done", "doing",
-    "will", "would", "shall", "should", "may", "might", "must", "can", "could",
+    "is",
+    "am",
+    "are",
+    "was",
+    "were",
+    "be",
+    "being",
+    "been",
+    "have",
+    "has",
+    "had",
+    "having",
+    "do",
+    "does",
+    "did",
+    "done",
+    "doing",
+    "will",
+    "would",
+    "shall",
+    "should",
+    "may",
+    "might",
+    "must",
+    "can",
+    "could",
     "ought",
-
     # Functional Adverbs & Particles
-    "not", "n't", "here", "there", "where", "when", "why", "how",
-    "very", "too", "also", "just", "only", "now", "then", "still", "already",
-    "even", "ever", "never", "always", "often", "sometimes", "usually",
-    "almost", "quite", "rather", "well", "else", "more", "most", "less", "least",
+    "not",
+    "n't",
+    "here",
+    "there",
+    "where",
+    "when",
+    "why",
+    "how",
+    "very",
+    "too",
+    "also",
+    "just",
+    "only",
+    "now",
+    "then",
+    "still",
+    "already",
+    "even",
+    "ever",
+    "never",
+    "always",
+    "often",
+    "sometimes",
+    "usually",
+    "almost",
+    "quite",
+    "rather",
+    "well",
+    "else",
+    "more",
+    "most",
+    "less",
+    "least",
 }
 
 # Regex patterns for entities and sensitive data
-RE_EMAIL = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
-RE_PHONE = re.compile(r'^(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{4}$')
-RE_IP = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
-RE_NUMBER = re.compile(r'^[\$€£₩¥]?\d+(?:,\d{3})*(?:\.\d+)?%?$')
-RE_UUID = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
-RE_SECRET_KEY = re.compile(r'^(?:sk-|ak-|ghp_|gho_|xoxb-|xoxp-|sec_)[A-Za-z0-9_-]{12,}$')
+RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+RE_PHONE = re.compile(PHONE_PATTERN)
+RE_IP = re.compile(IP_PATTERN)
+RE_NUMBER = re.compile(r"^[\$€£₩¥]?\d+(?:,\d{3})*(?:\.\d+)?%?$")
+RE_UUID = re.compile(UUID_PATTERN)
+RE_SECRET_KEY = re.compile(SECRET_PATTERN)
 
 
 class EnglishGrammarEngine:
@@ -70,18 +249,20 @@ class EnglishGrammarEngine:
         return clean in CLOSED_CLASS_WORDS
 
     @staticmethod
-    def classify_token(
-        word: str, is_sentence_start: bool = False,
-        mask_sentence_initial_entities: bool = False,
-    ) -> Tuple[TokenType, bool]:
+    def classify_token(word: str) -> Tuple[TokenType, bool]:
         """Classify a token into TokenType and whether it should be masked."""
         clean = word.strip()
         if clean.endswith("'s"):
             clean = clean[:-2]
-        lower = clean.lower()
 
         # Check sensitive patterns first
-        if RE_EMAIL.match(clean) or RE_PHONE.match(clean) or RE_IP.match(clean) or RE_UUID.match(clean) or RE_SECRET_KEY.match(clean):
+        if (
+            RE_EMAIL.match(clean)
+            or RE_PHONE.match(clean)
+            or RE_IP.match(clean)
+            or RE_UUID.match(clean)
+            or RE_SECRET_KEY.match(clean)
+        ):
             return TokenType.ENTITY, True
 
         # Check numeric patterns
@@ -89,11 +270,11 @@ class EnglishGrammarEngine:
             return TokenType.NUMBER, True
 
         # Check closed-class grammar words
-        if lower in CLOSED_CLASS_WORDS:
+        if EnglishGrammarEngine.is_grammatical(clean):
             return TokenType.GRAMMAR, False
 
-        # Capitalized token not at sentence start is likely a Named Entity (proper noun)
-        if clean.istitle() and (not is_sentence_start or mask_sentence_initial_entities) and len(clean) > 1:
+        # Capitalization is a conservative entity cue, including sentence starts.
+        if clean.istitle() and len(clean) > 1:
             return TokenType.ENTITY, True
 
         # All-caps token (e.g. acronyms, organizations)
