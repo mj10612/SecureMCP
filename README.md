@@ -50,7 +50,7 @@ This is heuristic masking, not a proof of anonymity, cryptographic zero knowledg
 | SecureMCP | **0.5.0** |
 | Python | **3.10 · 3.11 · 3.12 · 3.13 · 3.14** in CI; package requires Python ≥ 3.10 |
 | Operating systems | **Windows · macOS · Linux** in CI |
-| Claude Code gateway | **2.1.287** native CLI verified with fake subscription OAuth and an offline provider |
+| Claude Code gateway | **2.1.287** native fixtures verified; live subscription HTTP 200 verified, model refusal remains |
 | Codex gateway | **CLI 0.160.0** native fixture tests and a live ChatGPT subscription request with automatic restoration verified |
 | MCP transport | Local **stdio**; CLI HTTP/SSE transports are disabled |
 | Natural languages | **English · 한국어 · mixed input** |
@@ -59,8 +59,10 @@ This is heuristic masking, not a proof of anonymity, cryptographic zero knowledg
 The [CI matrix](.github/workflows/ci.yml) covers 15 Python/OS combinations. Code-language
 support describes lexer modes, not compatibility with every language release or compiler.
 The gateway is experimental. Native fixture tests verify routing/masking/restoration.
-Codex passed a live subscription smoke test; Claude live inference remains unverified because
-the signed-in account returned a usage-limit response. This does not certify all-traffic privacy.
+Codex passed a live subscription smoke test. Claude's attribution masking bug is fixed;
+live requests now return HTTP 200, but a Sonnet safety-filter refusal prevents successful
+answer/restoration verification. The earlier 429 was not subscription exhaustion.
+This does not certify all-traffic privacy.
 
 ---
 
@@ -290,7 +292,7 @@ API 키 요청은 거부하므로 유료 API로 자동 전환하지 않습니다
 남겨 두었습니다. [설치·해제 및 보호 범위](docs/GATEWAY.md)를 확인하세요.
 
 Claude Code 2.1.287·Codex 0.160.0의 실제 CLI를 모의 OAuth/로컬 서버로 검증했습니다.
-Codex는 실제 구독 요청·자동 복원까지 확인했습니다. Claude는 계정 사용량 제한으로 실제 응답 검증을 완료하지 못했습니다. 이미지·원격 첨부·미지원 요청은 차단하고,
+Codex는 실제 구독 요청·자동 복원까지 확인했습니다. Claude는 식별 블록 처리 오류를 수정해 실제 구독 HTTP 200을 확인했지만, Sonnet 안전 필터 거절로 정상 답변·복원 검증이 남았습니다. 기존 429는 구독 한도 소진이 아니었습니다. 이미지·원격 첨부·미지원 요청은 차단하고,
 게이트웨이 밖의 도구 네트워크·텔레메트리까지 보호한다고 주장하지 않습니다.
 
 SecureMCP는 영어·한국어·혼합 문장을 로컬에서 마스킹하고 복원합니다. 클라우드에 요청하기

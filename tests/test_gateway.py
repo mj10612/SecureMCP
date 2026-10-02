@@ -18,6 +18,80 @@ from secure_mcp.gateway_install import (
 )
 
 
+def test_claude_attribution_stays_first_without_exposing_user_context():
+    from secure_mcp.gateway import PUBLIC_CLAUDE_IDENTITIES, PRIVACY_INSTRUCTION
+
+    session = GatewaySession()
+    attribution = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.287.63f; cc_entrypoint=sdk-cli;",
+        "cache_control": {"type": "ephemeral"},
+    }
+    payload = {
+        "model": "fixture",
+        "system": [
+            attribution,
+            {"type": "text", "text": PUBLIC_CLAUDE_IDENTITIES[1]},
+            {"type": "text", "text": "PrivateCompany alice@example.com"},
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": "Review A\n```python\ndef A(secret):\n    return secret + 42\n```",
+            }
+        ],
+    }
+    masked = session.request(payload)
+    assert masked["system"][0] == attribution
+    assert masked["system"][1]["text"] == PUBLIC_CLAUDE_IDENTITIES[1]
+    assert masked["system"][-1]["text"] == PRIVACY_INSTRUCTION
+    assert all(
+        secret not in json.dumps(masked)
+        for secret in ["PrivateCompany", "alice@example.com", "def A(", "secret + 42"]
+    )
+    assert "x-anthropic-billing-header" not in session.mask(attribution["text"])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x-anthropic-billing-header: cc_version=2.1.287.63f; cc_entrypoint=sdk-cli;\nprivateCompany secret",
+        "x-anthropic-billing-header: cc_version=2.1.287; cc_entrypoint=privateCompany;",
+        "x-anthropic-billing-header: cc_version=2.1.287; cc_entrypoint=cli; secret=123;",
+    ],
+)
+def test_claude_attribution_cannot_hide_private_text(text):
+    with pytest.raises(ValueError, match="attribution"):
+        GatewaySession().request(
+            {"messages": [], "system": [{"type": "text", "text": text}]}
+        )
+
+
+def test_claude_attribution_cannot_be_moved_or_merged():
+    block = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.287; cc_entrypoint=cli;",
+    }
+    session = GatewaySession()
+    with pytest.raises(ValueError, match="attribution"):
+        session.request(
+            {
+                "messages": [],
+                "system": [{"type": "text", "text": "private context"}, block],
+            }
+        )
+    with pytest.raises(ValueError, match="attribution"):
+        session.request({"messages": [], "system": block["text"]})
+
+
+def test_claude_public_identity_in_source_is_still_masked():
+    from secure_mcp.gateway import PUBLIC_CLAUDE_IDENTITIES
+
+    session = GatewaySession()
+    code = "identity = " + repr(PUBLIC_CLAUDE_IDENTITIES[1])
+    assert PUBLIC_CLAUDE_IDENTITIES[1] not in session.mask(code, code=True)
+
+
 def test_shared_prompt_code_and_korean_roundtrip():
     session = GatewaySession()
     payload = {
@@ -512,7 +586,7 @@ def test_source_identifier_overrides_task_vocabulary_and_unfenced_code_is_lexed(
     code = session.mask(
         'def review(secret):\n    return "private literal" + secret + 42'
     )
-    assert "private literal" not in code and "42" not in code
+    assert "private literal" not in code and not re.search(r"\b42\b", code)
     alias = session.session.forward_store["code:identifier:review"].surrogate
     assert alias in session.mask("Please review review.")
     assert (

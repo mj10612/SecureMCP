@@ -16,6 +16,15 @@ secure-mcp gateway status
 ```
 
 Restart both agents. No per-prompt wrapper, file list or manual restoration is required.
+If an earlier gateway is already running, update/restart it from the repository:
+
+```bash
+uv tool install --force .
+secure-mcp gateway stop
+secure-mcp gateway install
+```
+
+Then restart both agents. These steps are needed only when updating the installed gateway.
 `--agent claude` / `--agent codex` limits setup to one host; default is `both`.
 `--port` selects the initial port, and `--config` selects local state. Installation is user-wide.
 
@@ -82,6 +91,15 @@ known source identifiers take priority over that vocabulary. Code lexing has no 
 preservation exception. Core tool descriptions use fixed public descriptions, and an explicit
 privacy instruction tells the model to keep supplied aliases unchanged.
 
+Claude's first system attribution block (`x-anthropic-billing-header`) is protocol,
+not source text. Its observed version, entry-point and optional hexadecimal fingerprint
+fields are validated and preserved exactly in the first position, together with validated
+cache-control tags. Unknown fields, extra text, moved/merged blocks and invalid cache tags
+fail closed. Exact public Claude CLI/Agent SDK identity sentences also remain visible;
+those sentences inside source literals are still masked. All other system context is
+masked, and the privacy instruction is appended after the original blocks. Anthropic
+[documents this positional attribution contract](https://code.claude.com/docs/en/llm-gateway-protocol#system-prompt-attribution-block).
+
 JSON replies and SSE text/tool-argument deltas are restored. Streams are buffered until
 complete so split aliases can be folded before restoration. This adds latency and removes
 live token-by-token display. Unknown/altered aliases fail rather than inventing originals.
@@ -123,8 +141,12 @@ stable mappings, OAuth forwarding and API-key refusal. Captured provider-bound r
 exclude the fixture function name and email. These fixture tests use no real subscription
 credentials or model calls. Separately, a live **Codex 0.160.0** smoke test passed with the
 existing ChatGPT login and restored an identifier automatically. A live **Claude 2.1.287**
-attempt reached Anthropic but returned HTTP 429; actual Claude model response/restoration
-with that login remains unverified. No API keys were used, and host settings were not installed
+comparison confirmed that direct requests succeeded and the former gateway 429 was caused
+by masking the attribution block, not subscription exhaustion. With the fix, actual
+subscription requests return HTTP 200 and plan-limit headers report `allowed`. Sonnet
+still returns a model safety-filter refusal (`bio`) on the benign masked smoke prompt;
+successful Claude answer/restoration remains unverified. The refusal is retained and no
+unmasked fallback is enabled. No API keys were used, and host settings were not installed
 during testing. Provider usage limits/entitlements still apply. macOS/Linux startup
 registration has format tests, not real login tests. Windows' hidden WScript launcher was
 also executed successfully with quoted paths; an actual OS login was not simulated.
@@ -139,7 +161,9 @@ also executed successfully with quoted paths; an actual OS login was not simulat
 기존 구독 로그인 파일·키체인은 변경하지 않습니다. 인증과 갱신은 각 CLI가 맡고, 게이트웨이는
 OAuth를 원래 서비스로 전달합니다. API 키는 거부하므로 유료 API로 자동 전환하지 않습니다.
 구독 한도는 그대로 적용됩니다. Codex는 실제 구독 요청과 자동 복원에 성공했습니다.
-Claude는 사용량 제한(HTTP 429)으로 실제 모델 응답 검증을 완료하지 못했습니다.
+Claude의 기존 429는 구독 한도 소진이 아니라 식별 블록 마스킹 오류였습니다.
+해당 오류를 수정해 실제 구독 요청의 HTTP 200을 확인했습니다. Sonnet의 별도 안전 필터 거절이
+남아 정상 답변·자동 복원의 실제 검증은 완료하지 못했습니다. 사용자 문맥·코드의 마스킹은 유지됩니다.
 
 새 Hook을 등록하지 않습니다. 운영체제 사용자 로그인 시 백그라운드로 자동 실행합니다.
 해제는 `secure-mcp gateway uninstall`이며, 설치 뒤 사용자가 수정한 설정은 덮어쓰지 않습니다.

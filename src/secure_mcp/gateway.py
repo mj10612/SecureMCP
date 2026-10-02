@@ -94,6 +94,18 @@ PRIVACY_INSTRUCTION = (
     "hidden literal values prevent analysis.\n"
 )
 PUBLIC_CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+PUBLIC_CLAUDE_IDENTITIES = (
+    PUBLIC_CLAUDE_IDENTITY,
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+)
+CLAUDE_ATTRIBUTION_PREFIX = "x-anthropic-billing-header:"
+# This positional protocol block is consumed by Anthropic before model inference.
+# Pin its observed fields rather than passing arbitrary system text through.
+CLAUDE_ATTRIBUTION = re.compile(
+    r"x-anthropic-billing-header: cc_version=[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}"
+    r"(?:\.[0-9a-f]{3})?; cc_entrypoint=(?:cli|sdk-cli);"
+    r"(?: cch=[0-9a-f]{6,64};)?[ \t]*"
+)
 TOOL_DESCRIPTIONS = {
     "Read": "Read a local file using file_path.",
     "Bash": "Run a local shell command using command.",
@@ -302,13 +314,13 @@ class GatewaySession:
         # Fenced/inline source is lexed, rather than replaced as an opaque block.
         parts = re.split(
             r"(```[^\n]*\n[\s\S]*?```|`[^`\n]+`|"
-            + re.escape(PUBLIC_CLAUDE_IDENTITY)
+            + "|".join(re.escape(identity) for identity in PUBLIC_CLAUDE_IDENTITIES)
             + ")",
             text,
         )
         output = []
         for part in parts:
-            if part == PUBLIC_CLAUDE_IDENTITY:
+            if part in PUBLIC_CLAUDE_IDENTITIES:
                 output.append(part)
                 continue
             if part.startswith("```") and "\n" in part and part.endswith("```"):
@@ -574,6 +586,9 @@ class GatewaySession:
         seed(payload.get("messages", payload.get("input", [])))
         result = {}
         for key, value in payload.items():
+            if key == "system" and "messages" in payload:
+                result[key] = self.claude_system(value)
+                continue
             if key == "safeguards":
                 result[key] = self.safeguards(value)
                 continue
@@ -615,6 +630,43 @@ class GatewaySession:
         for tool in result.get("tools", []):
             if tool.get("name") in TOOL_DESCRIPTIONS:
                 tool["description"] = TOOL_DESCRIPTIONS[tool["name"]]
+        return result
+
+    def claude_system(self, value):
+        if isinstance(value, str):
+            if value.startswith(CLAUDE_ATTRIBUTION_PREFIX):
+                raise ValueError(
+                    "Claude attribution must be a separate first system block."
+                )
+            return self.walk(value)
+        if not isinstance(value, list):
+            raise ValueError("Unsupported Claude system payload.")
+        result: list[dict[str, Any]] = []
+        for index, block in enumerate(value):
+            text = block.get("text", "") if isinstance(block, dict) else ""
+            if isinstance(text, str) and text.startswith(CLAUDE_ATTRIBUTION_PREFIX):
+                if (
+                    index != 0
+                    or block.get("type") != "text"
+                    or set(block) - {"type", "text", "cache_control"}
+                    or not CLAUDE_ATTRIBUTION.fullmatch(text)
+                ):
+                    raise ValueError(
+                        "Unrecognized Claude attribution; request was not forwarded."
+                    )
+                result.append({"type": "text", "text": text})
+                if "cache_control" in block:
+                    control = block["cache_control"]
+                    if (
+                        not isinstance(control, dict)
+                        or control.get("type") != "ephemeral"
+                        or set(control) - {"type", "ttl"}
+                        or control.get("ttl", "5m") not in {"5m", "1h"}
+                    ):
+                        raise ValueError("Unrecognized attribution cache control.")
+                    result[-1]["cache_control"] = deepcopy(control)
+            else:
+                result.append(self.walk(block))
         return result
 
     def response(self, body: bytes, content_type: str) -> bytes:
