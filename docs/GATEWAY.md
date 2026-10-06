@@ -81,10 +81,12 @@ are restored for native local tools; their results are masked in the next infere
 English, Korean and mixed references reuse the multilingual engine.
 
 Fenced code uses its language label; inline code is lexed and tool output uses language
-detection. Ordinary text uses `content_words`, known terms and uppercase single-letter
-references. This remains heuristic: ambiguous/unfenced or unsupported code needs clearer
-context. Grammar, syntax, public built-in tool names and protocol IDs stay visible. Masking
-does not hide algorithms or inferred meaning; it can reduce reasoning/edit quality.
+detection. A fragment that cannot be lexed safely (for example a backtick span containing an
+apostrophe) falls back to text masking instead of failing the request. Ordinary text uses
+`content_words`, known terms and uppercase single-letter references. This remains heuristic:
+ambiguous/unfenced or unsupported code needs clearer context. Grammar, syntax, public
+built-in tool names and protocol IDs stay visible. Masking does not hide algorithms or
+inferred meaning; it can reduce reasoning/edit quality.
 
 Common review/task vocabulary is retained in ordinary instructions to keep requests usable;
 known source identifiers take priority over that vocabulary. Code lexing has no identifier
@@ -112,15 +114,16 @@ live token-by-token display. Unknown/altered aliases fail rather than inventing 
 Schema properties and tool-argument JSON keys share aliases. Only pinned public Codex
 `exec` / `apply_patch` grammars pass unchanged; other custom grammars are blocked. Claude's
 safety classifier keeps public policy tags while private paths/rule operands are masked.
-Recognized public JSON Schema dialect URIs in `$schema` stay unchanged; unknown dialects
-are refused. Schema descriptions and private properties remain masked, including URI
-literals in source. Operational schema fields and JSON scalar numeric parameters retain
-their types; numbers in source text are masked.
+Recognized public JSON Schema dialect URIs in `$schema` stay unchanged; other
+`$schema` values are masked like ordinary text. Schema descriptions and private properties
+remain masked, including URI literals in source. Operational schema fields and JSON scalar
+numeric parameters retain their types; numbers in source text are masked.
 
-Signed Claude thinking and encrypted Codex reasoning remain exactly masked and are not
-restored for display. Only blocks previously emitted by this gateway can be replayed.
-Codex may omit an empty reasoning `content` list on replay; that empty field is normalized
-for provenance checking. Ciphertext, summaries and nonempty content remain validated.
+Signed Claude thinking (including `redacted_thinking`), and encrypted Codex reasoning remain
+exactly masked and are not restored for display. Only blocks previously emitted by this
+gateway can be replayed. Codex may omit an empty reasoning `content` list on replay; that
+empty field is normalized for provenance checking. Ciphertext, summaries and nonempty
+content remain validated.
 Claude/Codex have separate tables, shared across this installation's conversations/accounts;
 requests per agent are serialized. Use separate configurations/ports for separate trust domains.
 

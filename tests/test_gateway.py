@@ -381,6 +381,27 @@ class EchoProvider(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def test_uninstalled_config_can_be_reinstalled_with_a_new_port(tmp_path):
+    config = tmp_path / "state" / "config.json"
+    claude = tmp_path / "claude"
+    startup = tmp_path / "startup.vbs"
+    install_gateway(
+        config, agent="claude", port=38117, claude_dir=claude, startup_path=startup
+    )
+    uninstall_gateway(config)
+    assert config.exists()
+    install_gateway(
+        config, agent="claude", port=40000, claude_dir=claude, startup_path=startup
+    )
+    assert json.loads(config.read_text())["port"] == 40000
+    # An installed gateway still refuses an implicit port change.
+    with pytest.raises(ValueError, match="another port"):
+        install_gateway(
+            config, agent="claude", port=41000, claude_dir=claude, startup_path=startup
+        )
+    uninstall_gateway(config)
+
+
 def test_http_proxy_oauth_no_api_keys_or_raw_upstream(tmp_path):
     provider = ThreadingHTTPServer(("127.0.0.1", 0), EchoProvider)
     provider.requests = []
@@ -537,7 +558,7 @@ def test_legacy_snapshots_remain_readable_and_are_not_rewritten(tmp_path):
         gateway.server_close()
 
 
-def test_tool_schema_dialect_is_public_protocol_and_private_uris_are_refused():
+def test_tool_schema_dialect_is_public_protocol_and_private_uris_are_masked():
     session = GatewaySession()
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -547,10 +568,125 @@ def test_tool_schema_dialect_is_public_protocol_and_private_uris_are_refused():
     masked = session.walk(schema)
     assert masked["$schema"] == schema["$schema"]
     assert "privateField" not in json.dumps(masked)
-    with pytest.raises(ValueError, match="dialect"):
-        session.walk({"$schema": "https://privateCompany.example/schema"})
+    private = session.walk({"$schema": "https://privateCompany.example/schema"})
+    assert private["$schema"] != "https://privateCompany.example/schema"
+    assert "privateCompany" not in json.dumps(private)
     code = 'uri = "https://json-schema.org/draft/2020-12/schema"'
     assert schema["$schema"] not in session.mask(code, code=True)
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        "https://json-schema.org/schema",
+        "http://json-schema.org/draft-03/schema#",
+        "https://spec.openapis.org/oas/3.1/dialect/base",
+    ],
+)
+def test_additional_public_schema_dialects_pass_through(dialect):
+    session = GatewaySession()
+    masked = session.request(
+        {
+            "model": "fixture",
+            "input": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "t",
+                    "parameters": {"$schema": dialect, "type": "object"},
+                }
+            ],
+        }
+    )
+    assert dialect in json.dumps(masked)
+
+
+def test_non_string_schema_values_do_not_raise_type_errors():
+    session = GatewaySession()
+    masked = session.walk(
+        {"$schema": {"type": "object"}, "title": "confidentialSchema body"}
+    )
+    assert isinstance(masked["$schema"], dict)
+    assert "confidentialSchema" not in json.dumps(masked)
+    assert session.walk({"$schema": [1, 2]}) == {"$schema": [1, 2]}
+
+
+def test_tool_result_with_data_field_is_masked_not_rejected():
+    session = GatewaySession()
+    masked = session.walk(
+        {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": {"data": "customer-secret", "note": "keep"},
+        }
+    )
+    assert "customer-secret" not in json.dumps(masked)
+
+
+def test_redacted_thinking_is_opaque_and_replayable():
+    session = GatewaySession()
+    block = {"type": "redacted_thinking", "data": "ENCRYPTED-OPAQUE"}
+    assert session.walk(block, restore=True) == block
+    assert session.walk(block) == block
+    with pytest.raises(ValueError, match="reasoning"):
+        GatewaySession().walk(block)
+    with pytest.raises(ValueError, match="Binary/remote"):
+        GatewaySession().walk(
+            {"type": "image", "source": {"data": "x", "media_type": "image/png"}}
+        )
+
+
+def test_legacy_glued_numeric_alias_is_restored_in_gateway_tool_arguments():
+    session = GatewaySession()
+    first = session.mask("0.5", code=True)
+    second = session.mask(".1", code=True)
+    session.session.reverse_store[first].context = "code"
+    # Simulate a legacy masked edit that glued two numeric aliases together.
+    response = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "t2",
+                "name": "Edit",
+                "input": {
+                    "file_path": "pyproject.toml",
+                    "new_string": f"version = {first}{second}",
+                },
+            }
+        ]
+    }
+    restored = json.loads(
+        session.response(json.dumps(response).encode(), "application/json")
+    )
+    assert restored["content"][0]["input"]["new_string"] == "version = 0.5.1"
+
+
+def test_dotted_numbers_are_masked_as_one_token_and_restored():
+    session = GatewaySession()
+    masked = session.mask("version = 0.5.1", code=True)
+    assert session.restore(masked) == "version = 0.5.1"
+    for text in ("ip = 192.168.0.1", "release = 1.2.3"):
+        masked = session.mask(text, code=True)
+        assert session.restore(masked) == text
+
+
+def test_inline_code_with_apostrophe_falls_back_to_text_masking():
+    session = GatewaySession()
+    for text in (
+        "See `don't` here",
+        "Check `user's_name` field",
+        "```\ndon't panic now\n```",
+    ):
+        masked = session.mask(text)
+        assert "don't" not in masked and "user's_name" not in masked
+        assert session.restore(masked) == text
+
+
+def test_inline_code_fallback_never_forwards_raw_content():
+    session = GatewaySession()
+    masked = session.mask("Check `secretCustomerName` value")
+    assert "secretCustomerName" not in masked
+    assert session.restore(masked) == "Check `secretCustomerName` value"
 
 
 def test_auto_start_is_idempotent_and_stop_releases_daemon(tmp_path):

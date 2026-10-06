@@ -10,13 +10,14 @@ import uuid
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+from secure_mcp import __version__
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.models import MaskMode, SurrogateStrategy
 from secure_mcp.session import SessionVault
 
 app = MCPServer(
     name="SecureMCP",
-    version="0.2.0",
+    version=__version__,
     instructions=(
         "Local masking utilities. Model-invoked tool arguments are already visible to the provider. "
         "Use the trusted client-side LocalPrivacyClient before sending confidential input. "
@@ -242,7 +243,7 @@ def get_privacy_status() -> str:
     return json.dumps(
         {
             "server": "SecureMCP",
-            "version": "0.2.0",
+            "version": __version__,
             "active_sessions": vault.active_count,
             "protocol": "Model Context Protocol (MCP)",
         }

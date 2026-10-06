@@ -1,5 +1,7 @@
 """Tests for core masking engine (masking, unmasking, round-trip restoration)."""
 
+import pytest
+
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.engine.strategies import StrategyGenerator
 from secure_mcp.models import MaskMode, SurrogateStrategy
@@ -89,3 +91,47 @@ def test_roundtrip_code():
 
     unmask_res = engine.unmask(mask_res.masked_text, "code_sess", reverse)
     assert unmask_res.unmasked_text == code
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "version = 0.5.1",
+        "release = 1.2.3",
+        "ip = 192.168.0.1",
+        "x = 10.20.30.40",
+        'uri = "https://example.com:8443/v1.2.3"',
+    ],
+)
+def test_dotted_numbers_roundtrip_as_one_token(code):
+    engine = MaskingEngine()
+    gen = StrategyGenerator(SurrogateStrategy.UNICODE)
+    forward = {}
+    reverse = {}
+    mask_res = engine.mask_code(code, "dotted", gen, forward, reverse)
+    unmask_res = engine.unmask(mask_res.masked_text, "dotted", reverse, strict=True)
+    assert unmask_res.unmasked_text == code
+    assert unmask_res.unmatched_surrogates == []
+
+
+def test_legacy_glued_numeric_aliases_are_restored_and_reported():
+    engine = MaskingEngine()
+    gen = StrategyGenerator(SurrogateStrategy.UNICODE)
+    forward = {}
+    reverse = {}
+
+    engine.mask_code("first = 1.2\nsecond = 3.4", "legacy", gen, forward, reverse)
+    aliases = {
+        key.split(":", 2)[2]: mapping.surrogate
+        for key, mapping in forward.items()
+        if key.startswith("code:number:")
+    }
+    glued = aliases["1.2"] + aliases["3.4"]
+    # A foreign digit run that only shares the prefix is not a valid alias.
+    foreign = "732846" + "9" * 12 + aliases["1.2"]
+
+    result = engine.unmask(f"v = {glued}\nw = {foreign}", "legacy", reverse)
+    assert result.unmasked_text == "v = 1.23.4\nw = 7328469999999999991.2"
+    assert sorted(result.unmatched_surrogates) == ["732846999999999999"]
+    with pytest.raises(ValueError, match="Unrecognized"):
+        engine.unmask(foreign, "legacy", reverse, strict=True)

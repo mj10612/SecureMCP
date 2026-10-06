@@ -42,6 +42,12 @@ STRUCTURAL_WORDS = {
     "if",
 }
 STRUCTURAL_KO = {"그리고", "그러나", "및", "또는", "하지만"}
+# Code number aliases are "732846" + 12 digits (see StrategyGenerator.generate).
+# Legacy dotted numbers (0.5 + .1) could glue two aliases with no separator.
+NUMERIC_ALIAS_LENGTH = 18
+NUMERIC_ALIAS_RUN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:732846\d{12})+(?![A-Za-z0-9_])"
+)
 
 
 class MaskingEngine:
@@ -323,6 +329,28 @@ class MaskingEngine:
                 )
 
             output = masked_text
+            # Legacy masks could glue adjacent numeric aliases (0.5.1 -> two
+            # aliases with no separator). Recover only runs that are exactly a
+            # sequence of numeric aliases; foreign digit runs are left untouched.
+            glued_unmatched: list[str] = []
+
+            def restore_glued(match: re.Match[str]) -> str:
+                nonlocal count
+                run = match[0]
+                pieces = []
+                for offset in range(0, len(run), NUMERIC_ALIAS_LENGTH):
+                    chunk = run[offset : offset + NUMERIC_ALIAS_LENGTH]
+                    mapping = reverse_store.get(chunk)
+                    if mapping is None:
+                        glued_unmatched.append(chunk)
+                        pieces.append(chunk)
+                    else:
+                        count += 1
+                        unique.add(chunk)
+                        pieces.append(mapping.original)
+                return "".join(pieces)
+
+            output = NUMERIC_ALIAS_RUN.sub(restore_glued, output)
             if alternatives:
                 pattern = "|".join(alternatives)
                 if normalize_particles:
@@ -331,9 +359,12 @@ class MaskingEngine:
                         + pattern
                         + r")((?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
                     )
-                output = re.sub(pattern, restore, masked_text)
+                output = re.sub(pattern, restore, output)
             candidates = StrategyGenerator.get_pattern(strategy).findall(masked_text)
-            unmatched = sorted({c for c in candidates if c not in reverse_store})
+            unmatched = sorted(
+                {c for c in candidates if c not in reverse_store}
+                | set(glued_unmatched)
+            )
             if strict and unmatched:
                 raise ValueError(
                     "Unrecognized or altered surrogate tokens: " + ", ".join(unmatched)

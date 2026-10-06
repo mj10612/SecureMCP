@@ -198,9 +198,16 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
         else {"port": port, "token": secrets.token_urlsafe(32)}
     )
     if path.exists() and config["port"] != port:
-        raise ValueError(
-            "Existing installation uses another port; uninstall before changing it."
-        )
+        # After `gateway uninstall` the config file is intentionally retained
+        # for recovery (token/state), while installation.json is removed. With
+        # no active installation the stored port can be updated instead of
+        # leaving users stuck with no supported way to change it.
+        if previous_manifest is None:
+            config["port"] = port
+        else:
+            raise ValueError(
+                "Existing installation uses another port; uninstall before changing it."
+            )
     arguments = [
         sys.executable,
         "-m",

@@ -43,7 +43,9 @@ ALIASES = {
     "c++": "cpp",
 }
 NUMBER = re.compile(
-    r"(?:0[xX][\da-fA-F_'\.]+(?:[pP][+-]?\d+)?|0[bB][01_']+|0[oO][0-7_']+|(?:\d[\d_']*(?:\.\d[\d_']*)?|\.\d[\d_']*)(?:[eE][+-]?[\d_]+)?)[A-Za-z0-9_]*"
+    r"(?:0[xX][\da-fA-F_'\.]+(?:[pP][+-]?\d+)?|0[bB][01_']+|0[oO][0-7_']+|"
+    r"(?:\d[\d_']*(?:\.\d[\d_']*)*|\.\d[\d_']*(?:\.\d[\d_']*)*)"
+    r"(?:[eE][+-]?[\d_]+)?)[A-Za-z0-9_]*"
 )
 IDENTIFIER = re.compile(r"[^\W\d]\w*|_\w*", re.UNICODE)
 STRING_START = re.compile(r"[rRuUbBfF]{0,2}(\"\"\"|'''|\"|')")

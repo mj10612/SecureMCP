@@ -66,6 +66,15 @@ async def test_mcp_code_tools():
 
 
 @pytest.mark.asyncio
+async def test_mcp_server_reports_package_version():
+    from secure_mcp import __version__
+    from secure_mcp.server import get_privacy_status
+
+    assert app.version == __version__
+    assert json.loads(get_privacy_status())["version"] == __version__
+
+
+@pytest.mark.asyncio
 async def test_mcp_prompts():
     prompts = await app.list_prompts()
     prompt_names = [p.name for p in prompts]

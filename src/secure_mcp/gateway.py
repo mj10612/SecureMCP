@@ -29,9 +29,14 @@ LIMIT = 16 * 1024 * 1024
 JSON_SCHEMA_DIALECTS = {
     "https://json-schema.org/draft/2020-12/schema",
     "https://json-schema.org/draft/2019-09/schema",
+    "https://json-schema.org/schema",
+    "https://json-schema.org/schema#",
+    "http://json-schema.org/schema#",
     "http://json-schema.org/draft-07/schema#",
     "http://json-schema.org/draft-06/schema#",
     "http://json-schema.org/draft-04/schema#",
+    "http://json-schema.org/draft-03/schema#",
+    "https://spec.openapis.org/oas/3.1/dialect/base",
 }
 EXEC_GRAMMAR = r"""
 start: pragma_source | plain_source
@@ -317,13 +322,34 @@ class GatewaySession:
             json.dumps(stable, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
 
-    def mask(self, text: str, code: bool = False, language: str = "auto") -> str:
+    def _mask_prose(self, text: str, preserve_task_words: bool = True) -> str:
         s = self.session
-        if len(s.forward_store) > 100_000:
-            raise ValueError(
-                "Mapping limit reached; start a new local gateway session."
-            )
-        if code:
+        # Force capitalized single-letter names such as A (an English article).
+        terms = {m.original for m in s.forward_store.values()}
+        terms.update(re.findall(r"\b[A-Z]\b", text))
+        return self.engine.mask_text(
+            text,
+            s.session_id,
+            s.generator,
+            s.forward_store,
+            s.reverse_store,
+            mode=MaskMode.CONTENT_WORDS,
+            sensitive_terms=terms,
+            # Code fragments keep the "no identifier preservation" rule.
+            custom_preserve=TASK_WORDS if preserve_task_words else None,
+        ).masked_text
+
+    def _mask_source(self, text: str, language: str = "auto") -> str:
+        """Lex a source fragment, falling back to text masking for prose.
+
+        Code lexing rejects unterminated literals, which is correct for the
+        strict library API. Backtick/fence fragments inside a normal prompt can
+        be prose (an apostrophe like ``don't``), so retry that fragment with
+        text masking instead of failing the entire request. The fallback still
+        masks content words and never forwards the fragment unmasked.
+        """
+        s = self.session
+        try:
             return self.engine.mask_code(
                 text,
                 s.session_id,
@@ -332,6 +358,17 @@ class GatewaySession:
                 s.reverse_store,
                 language=language,
             ).masked_text
+        except ValueError:
+            return self._mask_prose(text, preserve_task_words=False)
+
+    def mask(self, text: str, code: bool = False, language: str = "auto") -> str:
+        s = self.session
+        if len(s.forward_store) > 100_000:
+            raise ValueError(
+                "Mapping limit reached; start a new local gateway session."
+            )
+        if code:
+            return self._mask_source(text, language)
         if "```" not in text and re.search(
             r"(?m)^\s*(?:async\s+def\s|def\s|class\s|function\s|const\s|let\s|var\s|package\s|func\s|fn\s|pub\s+fn\s|#\s*include\b|SELECT\s|[\w]+\s*=(?!=))",
             text,
@@ -372,29 +409,15 @@ class GatewaySession:
                 output.append(
                     header
                     + "\n"
-                    + self.mask(
-                        body[:-3], code=True, language=header[3:].strip() or "auto"
+                    + self._mask_source(
+                        body[:-3], header[3:].strip() or "auto"
                     )
                     + "```"
                 )
             elif part.startswith("`") and part.endswith("`") and len(part) > 1:
-                output.append("`" + self.mask(part[1:-1], code=True) + "`")
+                output.append("`" + self._mask_source(part[1:-1]) + "`")
             else:
-                # Force capitalized single-letter names such as A (an English article).
-                terms = {m.original for m in s.forward_store.values()}
-                terms.update(re.findall(r"\b[A-Z]\b", part))
-                output.append(
-                    self.engine.mask_text(
-                        part,
-                        s.session_id,
-                        s.generator,
-                        s.forward_store,
-                        s.reverse_store,
-                        mode=MaskMode.CONTENT_WORDS,
-                        sensitive_terms=terms,
-                        custom_preserve=TASK_WORDS,
-                    ).masked_text
-                )
+                output.append(self._mask_prose(part))
         return "".join(output)
 
     def restore(self, text):
@@ -428,12 +451,8 @@ class GatewaySession:
         kind = value.get("type", "")
         if not isinstance(kind, str):
             kind = ""
-        if kind in BLOCKED_TYPES or any(
-            k in value for k in ("image_url", "file_data", "file_id", "data")
-        ):
-            raise ValueError(
-                "Binary/remote attachments are unsupported by the privacy gateway."
-            )
+        # Signed/encrypted reasoning is decoded before the attachment check:
+        # redacted_thinking carries opaque `data` ciphertext by design.
         if kind in {"thinking", "redacted_thinking", "reasoning"}:
             key = self._opaque_key(value)
             if restore:
@@ -443,18 +462,35 @@ class GatewaySession:
                     "Unrecognized signed/encrypted reasoning; start a new conversation."
                 )
             return deepcopy(value)
+        if (
+            kind in BLOCKED_TYPES
+            or any(k in value for k in ("image_url", "file_data", "file_id"))
+            # `data` alone also occurs in ordinary tool results (for example a
+            # JSON field named "data"); only attachment metadata blocks it.
+            or (
+                "data" in value
+                and any(k in value for k in ("mimeType", "mime_type", "media_type"))
+            )
+        ):
+            raise ValueError(
+                "Binary/remote attachments are unsupported by the privacy gateway."
+            )
         if any(key in value for key in {"signature", "encrypted_content"}):
             raise ValueError(
                 "Opaque fields outside recognized reasoning are unsupported."
             )
-        result = {}
+        result: dict[str, Any] = {}
         for key, item in value.items():
-            if key == "$schema":
-                if item not in JSON_SCHEMA_DIALECTS:
-                    raise ValueError(
-                        "Unsupported JSON schema dialect; request was not forwarded."
-                    )
-                result[key] = item
+            if key == "$schema" and isinstance(item, str):
+                # Public JSON Schema dialect URIs stay usable. Anything else is
+                # private data and is masked/restored like ordinary text instead
+                # of rejecting the whole request.
+                if item in JSON_SCHEMA_DIALECTS:
+                    result[key] = item
+                elif restore:
+                    result[key] = self.restore(item)
+                else:
+                    result[key] = self.mask(item)
             elif key in {"name", "tool_name"}:
                 result[key] = (
                     self.restore(item)
