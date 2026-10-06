@@ -114,7 +114,9 @@ def test_shared_prompt_code_and_korean_roundtrip():
     assert a in prompt and a in source
     assert korean in prompt and korean in source
     assert "alice@example.com" not in json.dumps(masked)
-    assert "123" not in source
+    # "123" is short: only a standalone occurrence means a real leak, since the
+    # random numeric alias itself may contain those digits as a substring.
+    assert not re.search(r"(?<!\d)123(?!\d)", source)
     assert session.restore(source) == payload["input"][1]["output"]
     assert session.restore(prompt) == payload["input"][0]["content"]
 
