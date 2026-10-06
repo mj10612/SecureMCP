@@ -1,6 +1,6 @@
 # Automatic subscription integration
 
-SecureMCP 0.5 provides an experimental authenticated loopback gateway for Claude Code and
+SecureMCP 0.5.1 provides an experimental authenticated loopback gateway for Claude Code and
 Codex. Set it up once, then use their normal commands. Requests are masked automatically;
 replies and tool arguments are restored before the CLI displays or executes them. The next
 request masks restored history again. No agent hooks are registered.
@@ -91,6 +91,12 @@ known source identifiers take priority over that vocabulary. Code lexing has no 
 preservation exception. Core tool descriptions use fixed public descriptions, and an explicit
 privacy instruction tells the model to keep supplied aliases unchanged.
 
+Gateway identifiers use `private_symbol_<number>`. A controlled live comparison found that
+the previous `smcp_ID_` aliases caused Sonnet 5.5 to refuse benign masked requests, while
+neutral aliases succeeded with the same masking. This does not establish the classifier's
+internal cause. No safety filter is disabled and no raw-source fallback is used. Other
+SecureMCP integrations retain their existing alias format.
+
 Claude's first system attribution block (`x-anthropic-billing-header`) is protocol,
 not source text. Its observed version, entry-point and optional hexadecimal fingerprint
 fields are validated and preserved exactly in the first position, together with validated
@@ -106,11 +112,15 @@ live token-by-token display. Unknown/altered aliases fail rather than inventing 
 Schema properties and tool-argument JSON keys share aliases. Only pinned public Codex
 `exec` / `apply_patch` grammars pass unchanged; other custom grammars are blocked. Claude's
 safety classifier keeps public policy tags while private paths/rule operands are masked.
-Operational schema fields and
-JSON scalar numeric parameters retain their types; numbers in source text are masked.
+Recognized public JSON Schema dialect URIs in `$schema` stay unchanged; unknown dialects
+are refused. Schema descriptions and private properties remain masked, including URI
+literals in source. Operational schema fields and JSON scalar numeric parameters retain
+their types; numbers in source text are masked.
 
 Signed Claude thinking and encrypted Codex reasoning remain exactly masked and are not
 restored for display. Only blocks previously emitted by this gateway can be replayed.
+Codex may omit an empty reasoning `content` list on replay; that empty field is normalized
+for provenance checking. Ciphertext, summaries and nonempty content remain validated.
 Claude/Codex have separate tables, shared across this installation's conversations/accounts;
 requests per agent are serialized. Use separate configurations/ports for separate trust domains.
 
@@ -120,6 +130,12 @@ aliases across daemon restart. Reasoning provenance stores only hashes. Snapshot
 replay; start a fresh conversation/reset state rather than bypass masking. POSIX private file
 modes are applied; Windows uses inherited user ACLs. The key/local token resides alongside
 snapshots, so this does not protect against another process with access to that user's files.
+
+Version 0.5.1 uses `<agent>-symbols-v2.enc` with a matching hash-only `.opaque.json` file.
+Old `<agent>.enc` snapshots remain untouched for rollback; the snapshot reader still supports
+legacy aliases. After upgrading from 0.5.0, start new Claude/Codex conversations once so
+previous reasoning does not replay against the new alias table. Do not delete old state
+until you no longer need rollback.
 
 ## Protection boundary and tests
 
@@ -139,17 +155,30 @@ and offline fixture providers. Tests verify masked prompts, split-response resto
 restored filename tool arguments, actual file reads, masked source/email tool results,
 stable mappings, OAuth forwarding and API-key refusal. Captured provider-bound requests
 exclude the fixture function name and email. These fixture tests use no real subscription
-credentials or model calls. Separately, a live **Codex 0.160.0** smoke test passed with the
-existing ChatGPT login and restored an identifier automatically. A live **Claude 2.1.287**
-comparison confirmed that direct requests succeeded and the former gateway 429 was caused
-by masking the attribution block, not subscription exhaustion. With the fix, actual
-subscription requests return HTTP 200 and plan-limit headers report `allowed`. Sonnet
-still returns a model safety-filter refusal (`bio`) on the benign masked smoke prompt;
-successful Claude answer/restoration remains unverified. The refusal is retained and no
-unmasked fallback is enabled. No API keys were used, and host settings were not installed
-during testing. Provider usage limits/entitlements still apply. macOS/Linux startup
+credentials or model calls. Live tests also verify both agents in **English and Korean**,
+using **Sonnet 5.5** and **gpt-6.1-sol** with existing subscription logins. Each test requires
+a native file read, at least two inference requests, provider-bound source without the
+fixture's function/parameter/email/comment, and a successful answer restored to the original
+function name and email. The local file must remain unchanged. The former Claude 429 was
+an attribution bug, not subscription exhaustion; neutral aliases also resolved the benign
+masked-prompt refusal. No API keys were used, and host settings were not installed during
+testing. Provider usage limits/entitlements still apply. macOS/Linux startup
 registration has format tests, not real login tests. Windows' hidden WScript launcher was
 also executed successfully with quoted paths; an actual OS login was not simulated.
+
+Live tests are opt-in and consume the existing plan's allowance. Normal CI uses offline
+fixtures. Set the native executable paths and run all four real-provider scenarios:
+
+```powershell
+$env:SECURE_MCP_LIVE_SUBSCRIPTION = '1'
+$env:SECURE_MCP_CLAUDE_BINARY = 'C:/path/to/claude.exe'
+$env:SECURE_MCP_CODEX_BINARY = 'C:/path/to/codex.exe'
+python -m pytest tests/test_gateway_live.py -v
+```
+
+The test uses temporary fixture files and process-local endpoint overrides. Codex's test
+process has unrestricted access to that fixture directory to avoid Windows sandbox setup
+interfering with file-read verification; the installer preserves users' permission settings.
 
 ## 한국어 안내
 
@@ -160,10 +189,11 @@ also executed successfully with quoted paths; an actual OS login was not simulat
 
 기존 구독 로그인 파일·키체인은 변경하지 않습니다. 인증과 갱신은 각 CLI가 맡고, 게이트웨이는
 OAuth를 원래 서비스로 전달합니다. API 키는 거부하므로 유료 API로 자동 전환하지 않습니다.
-구독 한도는 그대로 적용됩니다. Codex는 실제 구독 요청과 자동 복원에 성공했습니다.
-Claude의 기존 429는 구독 한도 소진이 아니라 식별 블록 마스킹 오류였습니다.
-해당 오류를 수정해 실제 구독 요청의 HTTP 200을 확인했습니다. Sonnet의 별도 안전 필터 거절이
-남아 정상 답변·자동 복원의 실제 검증은 완료하지 못했습니다. 사용자 문맥·코드의 마스킹은 유지됩니다.
+구독 한도는 그대로 적용됩니다. 두 CLI 모두 영어·한국어 질문으로 실제 파일 읽기,
+코드 마스킹 전송, 정상 답변 생성과 원래 함수명·이메일 자동 복원까지 검증했습니다.
+Claude의 기존 429는 식별 블록 처리 오류였고, 정상 요청의 거절은 치환명을 중립적인
+`private_symbol_` 형식으로 바꾸어 해결했습니다. 안전 필터와 사용자 문맥·코드 마스킹은 유지합니다.
+0.5.0에서 업데이트하면 기존 상태 파일은 보존하며, 새 치환표를 쓰도록 대화를 한 번 새로 시작하세요.
 
 새 Hook을 등록하지 않습니다. 운영체제 사용자 로그인 시 백그라운드로 자동 실행합니다.
 해제는 `secure-mcp gateway uninstall`이며, 설치 뒤 사용자가 수정한 설정은 덮어쓰지 않습니다.

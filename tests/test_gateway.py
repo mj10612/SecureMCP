@@ -461,25 +461,96 @@ def test_encrypted_restart_preserves_shared_aliases_and_signed_reasoning(tmp_pat
         "type": "reasoning",
         "id": "r1",
         "summary": [],
+        "content": [],
         "encrypted_content": "ciphertext",
     }
     session.walk(block, restore=True)
     gateway.save("codex", session)
     gateway.server_close()
-    assert b"privateFunction" not in (state / "codex.enc").read_bytes()
+    assert b"privateFunction" not in (state / "codex-symbols-v2.enc").read_bytes()
     restarted = PrivacyGateway(
         ("127.0.0.1", 0), "password-local-token", state_dir=state
     )
     try:
         loaded = restarted.get_session("codex")
         assert loaded.mask("privateFunction", code=True) == alias
+        assert loaded.mask("secondPrivate", code=True) != alias
         assert loaded.restore(alias) == "privateFunction"
         assert (
             loaded.walk({**block, "status": "completed"})["encrypted_content"]
             == "ciphertext"
         )
+        replay = {key: value for key, value in block.items() if key != "content"}
+        assert loaded.walk(replay)["encrypted_content"] == "ciphertext"
+        for changed in (
+            {**replay, "encrypted_content": "changed"},
+            {**replay, "content": [{"type": "text", "text": "injected"}]},
+        ):
+            with pytest.raises(ValueError, match="Unrecognized"):
+                loaded.walk(changed)
     finally:
         restarted.server_close()
+
+
+def test_neutral_aliases_are_strict_and_do_not_collide_with_source_names():
+    session = GatewaySession()
+    alias = session.mask("private_symbol_1", code=True)
+    assert alias.startswith("private_symbol_") and alias != "private_symbol_1"
+    assert session.restore(alias) == "private_symbol_1"
+    with pytest.raises(ValueError, match="surrogate"):
+        session.restore("private_symbol_999999")
+
+
+def test_legacy_snapshots_remain_readable_and_are_not_rewritten(tmp_path):
+    from secure_mcp.encrypted_session import load_session, save_session
+    from secure_mcp.engine.strategies import mapping_key
+    from secure_mcp.models import SurrogateStrategy, TokenMapping, TokenType
+    from secure_mcp.session import PrivacySession
+
+    state = tmp_path / "sessions"
+    state.mkdir()
+    legacy = PrivacySession("gateway", strategy=SurrogateStrategy.UNICODE)
+    mapping = TokenMapping(
+        original="privateFunction",
+        surrogate="smcp_ID_42",
+        token_type=TokenType.IDENTIFIER,
+        context="code",
+    )
+    legacy.forward_store[
+        mapping_key(mapping.original, mapping.token_type, code=True)
+    ] = mapping
+    legacy.reverse_store[mapping.surrogate] = mapping
+    old = state / "codex.enc"
+    password = "local-migration-password"
+    save_session(old, legacy, password)
+    previous = old.read_bytes()
+    gateway = PrivacyGateway(("127.0.0.1", 0), password, state_dir=state)
+    try:
+        current = gateway.get_session("codex")
+        assert current.mask("privateFunction", code=True).startswith("private_symbol_")
+        gateway.save("codex", current)
+        assert old.read_bytes() == previous
+        assert (state / "codex-symbols-v2.enc").exists()
+        loaded = GatewaySession(load_session(old, password, "gateway"))
+        assert loaded.restore("smcp_ID_42") == "privateFunction"
+    finally:
+        gateway.server_close()
+
+
+def test_tool_schema_dialect_is_public_protocol_and_private_uris_are_refused():
+    session = GatewaySession()
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"privateField": {"type": "string"}},
+    }
+    masked = session.walk(schema)
+    assert masked["$schema"] == schema["$schema"]
+    assert "privateField" not in json.dumps(masked)
+    with pytest.raises(ValueError, match="dialect"):
+        session.walk({"$schema": "https://privateCompany.example/schema"})
+    code = 'uri = "https://json-schema.org/draft/2020-12/schema"'
+    assert schema["$schema"] not in session.mask(code, code=True)
 
 
 def test_auto_start_is_idempotent_and_stop_releases_daemon(tmp_path):

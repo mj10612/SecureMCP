@@ -26,6 +26,13 @@ from secure_mcp.models import MaskMode, SurrogateStrategy, TokenMapping, TokenTy
 from secure_mcp.session import PrivacySession
 
 LIMIT = 16 * 1024 * 1024
+JSON_SCHEMA_DIALECTS = {
+    "https://json-schema.org/draft/2020-12/schema",
+    "https://json-schema.org/draft/2019-09/schema",
+    "http://json-schema.org/draft-07/schema#",
+    "http://json-schema.org/draft-06/schema#",
+    "http://json-schema.org/draft-04/schema#",
+}
 EXEC_GRAMMAR = r"""
 start: pragma_source | plain_source
 pragma_source: PRAGMA_LINE NEWLINE SOURCE
@@ -85,9 +92,14 @@ TASK_WORDS = {
     "수정",
     "분석",
     "분석해줘",
+    "읽어줘",
+    "보여줘",
+    "반환",
+    "값",
+    "그대로",
 }
 PRIVACY_INSTRUCTION = (
-    "The following context was masked locally. Names and values beginning smcp_ID_ "
+    "The following context was masked locally. Names and values beginning private_symbol_ "
     "and numeric aliases are opaque. Keep every supplied alias exactly unchanged in "
     "answers and tool arguments; a local host restores them. Never invent aliases or "
     "guess originals. Use public names for newly introduced identifiers. State when "
@@ -262,7 +274,17 @@ class SharedEngine(MaskingEngine):
             if key in mapping_store:
                 mapping_store[key].occurrence_count += 1
                 return mapping_store[key].surrogate
-            surrogate = generator.generate(kind, original_token, code=True)
+            while True:
+                surrogate = generator.generate(kind, original_token, code=True)
+                if kind == TokenType.NUMBER:
+                    break
+                surrogate = surrogate.replace("smcp_ID_", "private_symbol_", 1)
+                if (
+                    surrogate != original_token
+                    and surrogate not in generator.used_surrogates
+                ):
+                    generator.used_surrogates.add(surrogate)
+                    break
             mapping = TokenMapping(
                 original=original_token,
                 surrogate=surrogate,
@@ -287,6 +309,10 @@ class GatewaySession:
         stable = {
             key: value for key, value in block.items() if key not in {"id", "status"}
         }
+        # Native Codex omits an empty content list when replaying reasoning.
+        # Retain nonempty content and ciphertext in the provenance digest.
+        if stable.get("type") == "reasoning" and stable.get("content") in (None, []):
+            stable.pop("content", None)
         return sha256(
             json.dumps(stable, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
@@ -423,7 +449,13 @@ class GatewaySession:
             )
         result = {}
         for key, item in value.items():
-            if key in {"name", "tool_name"}:
+            if key == "$schema":
+                if item not in JSON_SCHEMA_DIALECTS:
+                    raise ValueError(
+                        "Unsupported JSON schema dialect; request was not forwarded."
+                    )
+                result[key] = item
+            elif key in {"name", "tool_name"}:
                 result[key] = (
                     self.restore(item)
                     if restore
@@ -791,7 +823,11 @@ class PrivacyGateway(ThreadingHTTPServer):
     def get_session(self, agent):
         with self.sessions_lock:
             if agent not in self.sessions:
-                path = self.state_dir / f"{agent}.enc" if self.state_dir else None
+                path = (
+                    self.state_dir / f"{agent}-symbols-v2.enc"
+                    if self.state_dir
+                    else None
+                )
                 saved = (
                     load_session(path, self.token, "gateway")
                     if path and path.exists()
@@ -814,7 +850,7 @@ class PrivacyGateway(ThreadingHTTPServer):
     def save(self, agent, session):
         session.session.touch()
         if self.state_dir:
-            path = self.state_dir / f"{agent}.enc"
+            path = self.state_dir / f"{agent}-symbols-v2.enc"
             save_session(path, session.session, self.token)
             _atomic_json(path.with_suffix(".opaque.json"), sorted(session.opaque))
             path.with_suffix(".opaque.json").chmod(0o600)

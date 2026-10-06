@@ -96,7 +96,7 @@ def _session(sid, path, password, mode=None, strategy=None):
 
 
 @click.group(cls=LiteralArgumentGroup)
-@click.version_option(version="0.5.0")
+@click.version_option(version="0.5.1")
 def main():
     """SecureMCP: local English/Korean masking. Mask BEFORE sending data to a provider."""
 

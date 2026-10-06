@@ -30,7 +30,7 @@ class Provider(BaseHTTPRequestHandler):
         text = json.dumps(
             payload.get("messages", payload.get("input", [])), ensure_ascii=False
         )
-        aliases = re.findall(r"smcp_ID_\d+", text)
+        aliases = re.findall(r"private_symbol_\d+", text)
         alias = aliases[-1] if aliases else "missing-alias"
         if len(self.server.requests) > 1 and getattr(self.server, "tool_file", None):
             for session in self.server.gateway.sessions.values():
