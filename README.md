@@ -331,6 +331,7 @@ python -m pytest -W error --cov=secure_mcp --cov-report=term-missing --cov-fail-
 ## Documentation
 
 - [Subscription Gateway / 구독 로그인 자동 연동](docs/GATEWAY.md)
+- [Host Compatibility and Shared Contract / 호스트 호환성](docs/COMPATIBILITY.md)
 - [Legacy Local Claude Code & Codex Integration / 기존 Hook 안내](docs/LOCAL_INTEGRATION.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Issue Resolution and Review Notes](docs/ISSUE_RESOLUTION.md)

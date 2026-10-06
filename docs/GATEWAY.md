@@ -151,6 +151,12 @@ Only IPv4 loopback can bind; a local access token is mandatory. Production upstr
 fixed HTTPS origins; redirects and environment proxies are disabled when forwarding OAuth.
 Requests/replies are bounded to 16 MiB; upstream response reads time out after 180 seconds.
 
+Explicit API-key modes (for example xAI) are **opt-in at gateway construction only**:
+`/xai/v1/responses` and `/xai/v1/chat/completions` forward the caller's own API key to the
+fixed origin, and subscription tokens are refused there. The subscription installer never
+enables API mode, and there is no automatic fallback in either direction. xAI subscription
+reuse has not been verified; see [compatibility](COMPATIBILITY.md).
+
 Images, audio, binary/remote files, unknown request fields, WebSocket inference,
 `previous_response_id`, background/server-side truncation and compaction endpoints are
 unsupported and blocked. No raw pass-through exists. Telemetry, external MCP/browser/tool

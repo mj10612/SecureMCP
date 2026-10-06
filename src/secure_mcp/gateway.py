@@ -139,6 +139,14 @@ UPSTREAMS = {
     "claude": "https://api.anthropic.com",
     "codex": "https://chatgpt.com/backend-api/codex",
 }
+# Explicit API-key modes. These are never enabled implicitly and never fall
+# back to a subscription token; see docs/COMPATIBILITY.md and GATEWAY.md.
+API_UPSTREAMS = {
+    "xai": "https://api.x.ai",
+}
+API_AUTH_PREFIXES = {
+    "xai": "Bearer xai-",
+}
 PROTOCOL = {
     "type",
     "role",
@@ -886,12 +894,27 @@ class PrivacyGateway(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self, address, token: str, upstreams=None, state_dir: Path | None = None
+        self,
+        address,
+        token: str,
+        upstreams=None,
+        state_dir: Path | None = None,
+        api_upstreams=None,
     ):
         if address[0] != "127.0.0.1":
             raise ValueError("Gateway must bind to IPv4 loopback.")
         self.token = token
-        self.upstreams = upstreams or UPSTREAMS
+        self.upstreams = dict(upstreams or UPSTREAMS)
+        # Explicit API-key modes are opt-in at construction. They are never
+        # enabled by subscription installation and never share credentials.
+        self.api_upstreams = dict(api_upstreams or {})
+        for agent, origin in self.api_upstreams.items():
+            if agent not in API_AUTH_PREFIXES:
+                raise ValueError(f"Unsupported API mode: {agent}")
+            loopback = origin.startswith("http://127.0.0.1:")
+            if not origin.startswith("https://") and not loopback:
+                raise ValueError("API upstream must be a fixed HTTPS origin.")
+            self.upstreams[agent] = origin
         self.sessions: dict[str, GatewaySession] = {}
         self.sessions_lock = RLock()
         self.state_dir = state_dir
@@ -1057,6 +1080,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "/claude/v1/messages": ("claude", "/v1/messages"),
             "/claude/v1/messages/count_tokens": ("claude", "/v1/messages/count_tokens"),
             "/codex/responses": ("codex", "/responses"),
+            "/xai/v1/responses": ("xai", "/v1/responses"),
+            "/xai/v1/chat/completions": ("xai", "/v1/chat/completions"),
         }
         route = routes.get(self.path.split("?", 1)[0])
         if not route:
@@ -1065,13 +1090,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
         agent, path = route
+        if agent in API_AUTH_PREFIXES and agent not in self.server.api_upstreams:
+            self.send_body(
+                400,
+                b'{"error":"API mode is not enabled for this gateway instance"}',
+            )
+            return
         auth = self.headers.get("Authorization", "")
-        # Subscription-only boundary: never silently switch to paid API keys.
-        valid_auth = (
-            auth.startswith("Bearer sk-ant-oat")
-            if agent == "claude"
-            else auth.startswith("Bearer eyJ")
-        )
+        if agent in API_AUTH_PREFIXES:
+            # Explicit API mode: the caller's own API key is forwarded to the
+            # fixed origin. Subscription tokens are not accepted and no
+            # automatic fallback to or from subscription auth exists.
+            valid_auth = auth.startswith(API_AUTH_PREFIXES[agent])
+        else:
+            # Subscription-only boundary: never silently switch to paid API keys.
+            valid_auth = (
+                auth.startswith("Bearer sk-ant-oat")
+                if agent == "claude"
+                else auth.startswith("Bearer eyJ")
+            )
         if not valid_auth or self.headers.get("x-api-key"):
             self.send_body(
                 401,
