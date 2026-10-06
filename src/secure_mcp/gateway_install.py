@@ -81,36 +81,51 @@ def ensure_gateway(path: Path):
             if os.name == "nt"
             else {"start_new_session": True}
         )
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "secure_mcp",
-                "gateway",
-                "run",
-                "--config",
-                str(path.resolve()),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **options,
-        )
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if healthy(config):
-                # Keep the child handle owned and reap it after shutdown.
-                Thread(target=process.wait, daemon=True).start()
-                return
-            if process.poll() is not None:
-                break
-            time.sleep(0.1)
-        if process.poll() is None:
-            process.terminate()
-        process.wait()
-        raise ValueError(
-            "Local gateway could not start; no direct-provider fallback was enabled."
-        )
+        # Keep the child's stderr for diagnostics only; prompts and tokens are
+        # never logged by the gateway. A temp file avoids pipe backpressure.
+        diagnostics = tempfile.TemporaryFile()
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "secure_mcp",
+                    "gateway",
+                    "run",
+                    "--config",
+                    str(path.resolve()),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=diagnostics,
+                **options,
+            )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if healthy(config):
+                    # Keep the child handle owned and reap it after shutdown.
+                    Thread(target=process.wait, daemon=True).start()
+                    return
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            diagnostics.seek(0)
+            detail = diagnostics.read(2000).decode("utf-8", "replace").strip()
+            message = (
+                "Local gateway could not start; no direct-provider fallback was enabled."
+            )
+            if detail:
+                message += " (" + detail[-1000:] + ")"
+            raise ValueError(message)
+        finally:
+            diagnostics.close()
 
 
 def stop_gateway(path: Path):
