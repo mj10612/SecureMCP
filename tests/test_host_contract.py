@@ -7,6 +7,7 @@ gateway protection path; see docs/COMPATIBILITY.md.
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import re
 from threading import Thread
 import urllib.error
 import urllib.request
@@ -51,8 +52,11 @@ def test_contract_private_source_never_reaches_provider(dialect):
     factory = claude_payload if dialect == "claude" else codex_payload
     masked = session.request(factory(SECRET_CODE))
     serialized = json.dumps(masked, ensure_ascii=False)
-    for secret in ["privateFunction", "privateValue", "alice@example.com", "42"]:
+    for secret in ["privateFunction", "privateValue", "alice@example.com"]:
         assert secret not in serialized
+    # "42" is short: only a standalone occurrence means a real leak, since the
+    # random numeric alias itself may contain those digits as a substring.
+    assert not re.search(r"(?<!\d)42(?!\d)", serialized)
 
 
 def test_contract_prompt_and_code_share_alias(dialect):
