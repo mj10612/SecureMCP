@@ -96,7 +96,8 @@ def ensure_gateway(path: Path):
             stderr=subprocess.DEVNULL,
             **options,
         )
-        for _ in range(40):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             if healthy(config):
                 # Keep the child handle owned and reap it after shutdown.
                 Thread(target=process.wait, daemon=True).start()
