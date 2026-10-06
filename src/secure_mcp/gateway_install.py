@@ -74,7 +74,10 @@ def ensure_gateway(path: Path):
         if healthy(config):
             return
         options = (
-            {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS}
+            {
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            }
             if os.name == "nt"
             else {"start_new_session": True}
         )

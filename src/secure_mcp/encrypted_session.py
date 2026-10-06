@@ -27,6 +27,10 @@ _MAGIC = b"SecureMCP-session-v1\n"
 _SALT_SIZE = 16
 
 
+class SessionExpiredError(ValueError):
+    """The snapshot is beyond its idle TTL and must not be reused."""
+
+
 def _cipher(password: str, salt: bytes) -> Fernet:
     if not password:
         raise ValueError("A nonempty session password is required.")
@@ -164,7 +168,7 @@ def load_session(path: Path, password: str, session_id: str) -> PrivacySession:
         raise ValueError("Session file belongs to a different session ID.")
     if expired:
         session.clear()
-        raise ValueError(
+        raise SessionExpiredError(
             "Session file has expired; mask again with a new session file."
         )
     session.touch()

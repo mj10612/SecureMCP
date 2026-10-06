@@ -20,7 +20,7 @@ import urllib.request
 
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.engine.strategies import mapping_key
-from secure_mcp.encrypted_session import load_session, save_session
+from secure_mcp.encrypted_session import SessionExpiredError, load_session, save_session
 from secure_mcp.hooks import _atomic_json
 from secure_mcp.models import MaskMode, SurrogateStrategy, TokenMapping, TokenType
 from secure_mcp.session import PrivacySession
@@ -153,6 +153,13 @@ PROTOCOL = {
     "verbosity",
     "syntax",
 }
+# JSON Schema keywords whose direct child names are aliased by walk().
+# A local `$ref` pointer keeps array indexes and all other keywords intact so
+# the masked reference still resolves inside the masked schema.
+SCHEMA_NAME_KEYWORDS = {"properties", "$defs", "definitions"}
+# JSON data positions where protocol/schema exceptions must not apply:
+# enum/const/default/examples hold arbitrary data, not envelope metadata.
+DATA_KEYWORDS = {"enum", "const", "default", "examples"}
 TOOL_NAMES = {
     "Bash",
     "PowerShell",
@@ -587,23 +594,60 @@ class GatewaySession:
                     raise ValueError("Remote schema references are unsupported.")
                 segments = item[2:].split("/")
                 transformed = []
+                previous = ""
                 for segment in segments:
-                    decoded = segment.replace("~1", "/").replace("~0", "~")
-                    if decoded not in {"$defs", "definitions", "properties", "items"}:
+                    original = segment.replace("~1", "/").replace("~0", "~")
+                    decoded = original
+                    # Only names under properties/$defs/definitions were
+                    # aliased by walk(); schema keywords and array indexes
+                    # keep their spelling so the masked reference resolves.
+                    if (
+                        previous in SCHEMA_NAME_KEYWORDS
+                        and decoded not in ARGUMENT_KEYS
+                    ):
                         decoded = (
                             self.restore(decoded)
                             if restore
-                            else decoded
-                            if decoded in ARGUMENT_KEYS
                             else self.mask(decoded, code=True)
                         )
                     transformed.append(decoded.replace("~", "~0").replace("/", "~1"))
+                    previous = original
                 result[key] = "#/" + "/".join(transformed)
-            elif key in {"additionalProperties", "strict", "enum"}:
+            elif key in DATA_KEYWORDS:
+                # enum/const/default/examples hold arbitrary JSON data. Protocol
+                # and schema exceptions must not apply inside them, or private
+                # values under keys like id/type/model/cache_control leak.
+                result[key] = self.walk_data(item, restore)
+            elif key == "additionalProperties" and isinstance(item, dict):
+                result[key] = self.walk(item, restore, code)
+            elif key == "strict":
                 result[key] = self.walk(item, restore, code)
             else:
                 result[key] = self.walk(item, restore, code)
         return result
+
+    def walk_data(self, value, restore=False):
+        """Mask/restore arbitrary JSON data (enum/const/default/examples).
+
+        Protocol and schema exceptions do not apply here: keys such as id,
+        type, model or cache_control inside user data are still private.
+        """
+        if isinstance(value, str):
+            return self.restore(value) if restore else self.mask(value)
+        if isinstance(value, list):
+            return [self.walk_data(item, restore) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {
+            (
+                self.restore(key)
+                if restore
+                else key
+                if key in ARGUMENT_KEYS
+                else self.mask(key, code=True)
+            ): self.walk_data(item, restore)
+            for key, item in value.items()
+        }
 
     def safeguards(self, value):
         """Keep safety-policy enums usable while anonymizing paths/rule operands."""
@@ -858,32 +902,59 @@ class PrivacyGateway(ThreadingHTTPServer):
 
     def get_session(self, agent):
         with self.sessions_lock:
-            if agent not in self.sessions:
-                path = (
-                    self.state_dir / f"{agent}-symbols-v2.enc"
-                    if self.state_dir
-                    else None
-                )
-                saved = (
-                    load_session(path, self.token, "gateway")
-                    if path and path.exists()
-                    else None
-                )
-                session = GatewaySession(saved)
-                if path and path.with_suffix(".opaque.json").exists():
-                    digests = json.loads(
-                        path.with_suffix(".opaque.json").read_text(encoding="utf-8")
-                    )
-                    if not isinstance(digests, list) or any(
-                        not isinstance(x, str) or not re.fullmatch(r"[a-f0-9]{64}", x)
-                        for x in digests
+            current = self.sessions.get(agent)
+            if current is not None:
+                # Serialize with an in-flight request before dropping state.
+                with current.lock:
+                    if (
+                        not current.session.generator.closed
+                        and not current.session.is_expired()
                     ):
-                        raise ValueError("Invalid persisted reasoning state.")
-                    session.opaque = set(digests)
-                self.sessions[agent] = session
-            return self.sessions[agent]
+                        return current
+                    # An always-on daemon must apply the same idle TTL as a
+                    # restarted one: drop expired aliases and reasoning
+                    # provenance instead of silently reusing (and reviving)
+                    # them via save().
+                    current.session.clear()
+                    current.opaque.clear()
+                del self.sessions[agent]
+            path = (
+                self.state_dir / f"{agent}-symbols-v2.enc"
+                if self.state_dir
+                else None
+            )
+            saved = None
+            if path and path.exists():
+                try:
+                    saved = load_session(path, self.token, "gateway")
+                except SessionExpiredError:
+                    saved = None
+            session = GatewaySession(saved)
+            # Reasoning provenance is only meaningful while the matching alias
+            # table is alive. Expired/missing snapshots start fresh, so stale
+            # digests must not be loaded into the new table.
+            if saved is not None and path and path.with_suffix(".opaque.json").exists():
+                digests = json.loads(
+                    path.with_suffix(".opaque.json").read_text(encoding="utf-8")
+                )
+                if not isinstance(digests, list) or any(
+                    not isinstance(x, str) or not re.fullmatch(r"[a-f0-9]{64}", x)
+                    for x in digests
+                ):
+                    raise ValueError("Invalid persisted reasoning state.")
+                session.opaque = set(digests)
+            self.sessions[agent] = session
+            return session
 
     def save(self, agent, session):
+        if session.session.is_expired():
+            # Do not revive an expired session via touch(). Drop its aliases
+            # and provenance; the next get_session() replaces the registry
+            # entry after its own expiry check, so no registry lock is taken
+            # here (avoids lock inversion with the request path).
+            session.session.clear()
+            session.opaque.clear()
+            return
         session.session.touch()
         if self.state_dir:
             path = self.state_dir / f"{agent}-symbols-v2.enc"

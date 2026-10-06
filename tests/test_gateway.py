@@ -917,6 +917,148 @@ def test_schema_references_follow_definition_aliases():
     assert session.walk(masked, restore=True) == schema
 
 
+def test_schema_refs_through_combinators_and_indexes_stay_resolvable():
+    session = GatewaySession()
+    schema = {
+        "type": "object",
+        "properties": {
+            "value": {"oneOf": [{"type": "string"}, {"type": "number"}]},
+            "copy": {"$ref": "#/properties/value/oneOf/0"},
+            "nested": {"anyOf": [{"properties": {"secretField": {"type": "integer"}}}]},
+            "nestedCopy": {"$ref": "#/properties/nested/anyOf/0/properties/secretField"},
+        },
+    }
+    masked = session.walk(schema)
+
+    def resolve(document, pointer):
+        node = document
+        for segment in pointer[2:].split("/"):
+            segment = segment.replace("~1", "/").replace("~0", "~")
+            node = node[int(segment)] if isinstance(node, list) else node[segment]
+        return node
+
+    refs = [
+        value["$ref"]
+        for value in masked["properties"].values()
+        if isinstance(value, dict) and "$ref" in value
+    ]
+    assert len(refs) == 2
+    for ref in refs:
+        # The local pointer must resolve inside the masked schema it ships with.
+        assert resolve(masked, ref) is not None
+    assert "secretField" not in json.dumps(masked)
+    assert session.walk(masked, restore=True) == schema
+
+
+def test_enum_and_const_values_are_masked_even_with_protocol_keys():
+    session = GatewaySession()
+    payload = {
+        "messages": [],
+        "tools": [
+            {
+                "name": "lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "enum": [
+                                {
+                                    "id": "alice@example.com",
+                                    "type": "private-company",
+                                    "cache_control": {"secret": "customer-token"},
+                                    "model": "internal-model-name",
+                                }
+                            ],
+                            "const": {"role": "auditor", "status": "confidential"},
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    masked = session.request(payload)
+    dumped = json.dumps(masked["tools"])
+    for secret in [
+        "alice@example.com",
+        "private-company",
+        "customer-token",
+        "internal-model-name",
+        "auditor",
+        "confidential",
+    ]:
+        assert secret not in dumped
+    assert session.walk(masked["tools"], restore=True) == payload["tools"]
+
+
+def test_expired_gateway_session_is_not_revived_by_save():
+    import time
+
+    gateway = PrivacyGateway(("127.0.0.1", 0), "y" * 40)
+    try:
+        session = gateway.get_session("claude")
+        alias = session.mask("ConfidentialCustomer")
+        assert session.restore(alias) == "ConfidentialCustomer"
+        session.session.last_accessed = time.time() - 90000
+        assert session.session.is_expired()
+        gateway.save("claude", session)
+        replacement = gateway.get_session("claude")
+        assert replacement is not session
+        assert replacement.session.forward_store == {}
+        with pytest.raises(ValueError):
+            replacement.restore(alias)
+    finally:
+        gateway.server_close()
+
+
+def test_expired_snapshot_is_discarded_without_losing_file(tmp_path):
+    import time
+
+    state = tmp_path / "sessions"
+    state.mkdir()
+    gateway = PrivacyGateway(("127.0.0.1", 0), "z" * 40, state_dir=state)
+    try:
+        session = gateway.get_session("codex")
+        session.mask("privateFunction", code=True)
+        session.session.last_accessed = time.time() - 90000
+        gateway.save("codex", session)
+        reopened = PrivacyGateway(("127.0.0.1", 0), "z" * 40, state_dir=state)
+        try:
+            fresh = reopened.get_session("codex")
+            assert fresh.session.forward_store == {}
+        finally:
+            reopened.server_close()
+    finally:
+        gateway.server_close()
+
+    # A healthy snapshot still reloads across restarts.
+    healthy = PrivacyGateway(("127.0.0.1", 0), "w" * 40, state_dir=tmp_path / "ok")
+    try:
+        session = healthy.get_session("codex")
+        alias = session.mask("privateFunction", code=True)
+        healthy.save("codex", session)
+    finally:
+        healthy.server_close()
+    restarted = PrivacyGateway(("127.0.0.1", 0), "w" * 40, state_dir=tmp_path / "ok")
+    try:
+        assert restarted.get_session("codex").restore(alias) == "privateFunction"
+    finally:
+        restarted.server_close()
+
+
+def test_expired_load_session_raises_dedicated_error(tmp_path):
+    from secure_mcp.encrypted_session import SessionExpiredError, save_session
+    from secure_mcp.session import PrivacySession
+
+    path = tmp_path / "expired.enc"
+    session = PrivacySession("gateway", ttl_seconds=1)
+    session.last_accessed -= 10
+    save_session(path, session, "password")
+    with pytest.raises(SessionExpiredError):
+        from secure_mcp.encrypted_session import load_session
+
+        load_session(path, "password", "gateway")
+
+
 def test_sse_unicode_line_separator_stays_inside_json():
     session = GatewaySession()
     text = session.mask("privateFunction", code=True) + "\u2028public"

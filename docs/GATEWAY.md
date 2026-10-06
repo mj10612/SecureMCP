@@ -111,13 +111,16 @@ masked, and the privacy instruction is appended after the original blocks. Anthr
 JSON replies and SSE text/tool-argument deltas are restored. Streams are buffered until
 complete so split aliases can be folded before restoration. This adds latency and removes
 live token-by-token display. Unknown/altered aliases fail rather than inventing originals.
-Schema properties and tool-argument JSON keys share aliases. Only pinned public Codex
+Schema properties and tool-argument JSON keys share aliases. Local `$ref` pointers keep
+keywords and array indexes so masked schemas still resolve. Only pinned public Codex
 `exec` / `apply_patch` grammars pass unchanged; other custom grammars are blocked. Claude's
 safety classifier keeps public policy tags while private paths/rule operands are masked.
 Recognized public JSON Schema dialect URIs in `$schema` stay unchanged; other
 `$schema` values are masked like ordinary text. Schema descriptions and private properties
-remain masked, including URI literals in source. Operational schema fields and JSON scalar
-numeric parameters retain their types; numbers in source text are masked.
+remain masked, including URI literals in source. `enum`/`const`/`default`/`examples` values
+are treated as data: protocol-named keys such as `id`, `type` or `cache_control` inside
+them are still masked. Operational schema fields and JSON scalar numeric parameters retain
+their types; numbers in source text are masked.
 
 Signed Claude thinking (including `redacted_thinking`), and encrypted Codex reasoning remain
 exactly masked and are not restored for display. Only blocks previously emitted by this
@@ -129,7 +132,8 @@ requests per agent are serialized. Use separate configurations/ports for separat
 
 Encrypted snapshots reuse SecureMCP's authenticated encryption and password KDF. They preserve
 aliases across daemon restart. Reasoning provenance stores only hashes. Snapshots expire after
-24 hours idle, but files are not automatically deleted. Expired/corrupt reasoning state blocks
+24 hours idle; the running daemon and a restarted daemon both drop expired aliases and
+provenance (files are not automatically deleted). Expired/corrupt reasoning state blocks
 replay; start a fresh conversation/reset state rather than bypass masking. POSIX private file
 modes are applied; Windows uses inherited user ACLs. The key/local token resides alongside
 snapshots, so this does not protect against another process with access to that user's files.
