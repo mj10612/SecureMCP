@@ -151,11 +151,16 @@ Only IPv4 loopback can bind; a local access token is mandatory. Production upstr
 fixed HTTPS origins; redirects and environment proxies are disabled when forwarding OAuth.
 Requests/replies are bounded to 16 MiB; upstream response reads time out after 180 seconds.
 
-Explicit API-key modes (for example xAI) are **opt-in at gateway construction only**:
+Explicit xAI API-key mode is **opt-in through separate API commands**:
 `/xai/v1/responses` and `/xai/v1/chat/completions` forward the caller's own API key to the
 fixed origin, and subscription tokens are refused there. The subscription installer never
 enables API mode, and there is no automatic fallback in either direction. xAI subscription
-reuse has not been verified; see [compatibility](COMPATIBILITY.md).
+reuse has not been verified. `gateway api-install --provider xai --model MODEL` adds
+an explicitly selectable Grok custom model; `gateway api-run` runs it in the foreground,
+and `gateway api-uninstall` restores the backed-up settings. API configuration, port,
+token and encrypted state are separate from subscription mode. Only `https://api.x.ai`
+is a production API origin. See the [Grok/API guide](GROK.md) and
+[compatibility table](COMPATIBILITY.md) for the verified scope and API billing boundary.
 
 Images, audio, binary/remote files, unknown request fields, WebSocket inference,
 `previous_response_id`, background/server-side truncation and compaction endpoints are

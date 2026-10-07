@@ -42,6 +42,8 @@ def atomic_bytes(path: Path, data: bytes):
 
 def load_config(path: Path):
     config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Gateway configuration must be a JSON object.")
     if not isinstance(config.get("port"), int) or not 1024 <= config["port"] <= 65535:
         raise ValueError("Invalid gateway port.")
     if not isinstance(config.get("token"), str) or len(config["token"]) < 32:
@@ -118,9 +120,7 @@ def ensure_gateway(path: Path):
                     process.wait()
             diagnostics.seek(0)
             detail = diagnostics.read(2000).decode("utf-8", "replace").strip()
-            message = (
-                "Local gateway could not start; no direct-provider fallback was enabled."
-            )
+            message = "Local gateway could not start; no direct-provider fallback was enabled."
             if detail:
                 message += " (" + detail[-1000:] + ")"
             raise ValueError(message)
@@ -216,6 +216,8 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
         if path.exists()
         else {"port": port, "token": secrets.token_urlsafe(32)}
     )
+    if config.get("mode", "subscription") != "subscription":
+        raise ValueError("API configuration cannot be used for subscription setup.")
     if path.exists() and config["port"] != port:
         # After `gateway uninstall` the config file is intentionally retained
         # for recovery (token/state), while installation.json is removed. With
@@ -238,11 +240,6 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
     ]
     startup, startup_data = startup_registration(arguments, startup_path)
     changes = {startup: startup_data}
-    manifest = (
-        json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest_path.exists()
-        else {"files": {}}
-    )
     if agent in {"claude", "both"}:
         settings = (
             claude_dir
@@ -298,6 +295,14 @@ def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_pat
             "http_headers": {"X-SecureMCP-Token": config["token"]},
         }
         changes[settings] = tomlkit.dumps(value).encode()
+    return apply_settings(path, config, changes)
+
+
+def apply_settings(path: Path, config, changes):
+    """Back up and transactionally apply settings, shared by subscription/API setup."""
+    manifest_path = path.parent / "installation.json"
+    previous_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
+    manifest = json.loads(previous_manifest) if previous_manifest else {"files": {}}
     # Prepare and validate every file before any host settings are changed.
     for settings, data in changes.items():
         name = str(settings.resolve())

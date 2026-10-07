@@ -541,6 +541,8 @@ def gateway_run(config):
 
     try:
         settings = load_config(config or default_config())
+        if settings.get("mode", "subscription") != "subscription":
+            raise ValueError("Use gateway api-run for API configuration.")
         state = (config or default_config()).resolve().parent / "sessions"
         with PrivacyGateway(
             ("127.0.0.1", settings["port"]), settings["token"], state_dir=state
@@ -593,6 +595,66 @@ def gateway_stop(config):
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
     click.echo("Gateway stopped.")
+
+
+@gateway.command("api-install")
+@click.option("--provider", type=click.Choice(["xai"]), required=True)
+@click.option("--model", required=True, help="xAI model ID; API charges apply.")
+@click.option("--config", type=click.Path(path_type=Path))
+@click.option("--grok-home", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--port", type=click.IntRange(1024, 65535), default=38118)
+def gateway_api_install(provider, model, config, grok_home, port):
+    """Opt into separately billed xAI API mode and add a Grok custom model."""
+    from secure_mcp.xai_install import default_api_config, install_api
+
+    try:
+        install_api(config or default_api_config(), model, port, grok_home)
+    except (ValueError, OSError, TypeError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(
+        "xAI API mode configured. API charges apply; browser subscription login is not used."
+    )
+    click.echo(
+        "Run gateway api-run, then select grok -m secure_mcp_xai with XAI_API_KEY in its environment."
+    )
+
+
+@gateway.command("api-run")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_api_run(config):
+    """Run the isolated xAI API gateway in the foreground; Ctrl+C stops it."""
+    from secure_mcp.gateway import API_UPSTREAMS, PrivacyGateway
+    from secure_mcp.xai_install import default_api_config, load_api_config
+
+    path = config or default_api_config()
+    try:
+        settings = load_api_config(path)
+        with PrivacyGateway(
+            ("127.0.0.1", settings["port"]),
+            settings["token"],
+            upstreams={},
+            api_upstreams={"xai": API_UPSTREAMS["xai"]},
+            state_dir=path.resolve().parent / "sessions",
+        ) as server:
+            server.serve_forever()
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@gateway.command("api-uninstall")
+@click.option("--config", type=click.Path(path_type=Path))
+def gateway_api_uninstall(config):
+    """Stop API mode and restore the backed-up Grok settings, preserving logins."""
+    from secure_mcp.gateway_install import uninstall_gateway
+    from secure_mcp.xai_install import default_api_config, load_api_config
+
+    path = config or default_api_config()
+    try:
+        load_api_config(path)
+        uninstall_gateway(path)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("Grok settings restored. API gateway stopped.")
 
 
 if __name__ == "__main__":

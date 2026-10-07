@@ -1,5 +1,19 @@
 # Issue review and resolution (0.2.0)
 
+## Host expansion follow-up (2026-10-07)
+
+| Issue | Implemented evidence | Remaining boundary |
+| --- | --- | --- |
+| [#67](https://github.com/mj10612/SecureMCP/issues/67) | Versioned host/OS/auth/cost/scope table; shared Claude/Codex/xAI contract checks actual reads, bilingual aliases, schemas, split SSE, status codes, refreshed credentials and isolated encrypted state; offline suite runs in CI | Unverified hosts remain explicit candidates; live inference is opt-in |
+| [#66](https://github.com/mj10612/SecureMCP/issues/66) | Separate API install/run/uninstall, fixed xAI origin, original settings/login preservation, token/state/auth isolation; actual Grok 1.0.46 English/Korean file-read and split SSE fixtures; API control leakage and model-collision regression coverage | Live paid API checks require separate opt-in; browser subscription reuse is unverified and unsupported |
+| [#65](https://github.com/mj10612/SecureMCP/issues/65) | Actual Antigravity CLI 1.3.0 stdio config, conflict/preservation/space-path tests, initialize/list/tools handshake; SDK 0.1.20 actual endpoint/header probe | SDK cannot send mandatory local/provider authentication headers through its supported config; full SDK inference protection remains blocked. IDE/CLI subscription redirection is unverified |
+
+See [compatibility](COMPATIBILITY.md), [Antigravity](ANTIGRAVITY.md), and
+[Grok/xAI](GROK.md) for setup and exact verification scope. These records describe
+local implementation and evidence; they do not imply that GitHub issues were closed.
+
+## Original masking issue resolution
+
 All 55 issues were reviewed against the code. Previously resolved #1–8 retain regression
 coverage, adjusted where the safer 0.2 API deliberately changes representations or the MCP
 trust boundary. The 47 remaining reports are covered by these changes and tests.

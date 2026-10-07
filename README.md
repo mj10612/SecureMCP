@@ -35,6 +35,12 @@ automatic startup, tested versions and the exact protection boundary.
 Legacy agent hooks remain optional utilities. They cover selected tool text rather than
 complete requests; [local integration](docs/LOCAL_INTEGRATION.md) documents their limits.
 
+Other hosts have explicit support levels in the [compatibility table](docs/COMPATIBILITY.md).
+[Antigravity](docs/ANTIGRAVITY.md) provides verified stdio MCP utility integration;
+SDK gateway authentication is currently blocked by SDK 0.1.20's header configuration limits.
+The separate [xAI API mode and Grok custom model](docs/GROK.md) require opt-in and incur
+API charges, independently of Claude/Codex or Grok subscriptions.
+
 Mask confidential input **before** sending it to a provider. Restore responses in your trusted
 local application and show them to the user there. Model-invoked MCP tool arguments are already
 visible to the provider; adding this server to Claude Desktop or Cursor does not automatically

@@ -153,6 +153,7 @@ PROTOCOL = {
     "id",
     "call_id",
     "tool_use_id",
+    "tool_call_id",
     "model",
     "status",
     "stop_reason",
@@ -270,6 +271,118 @@ ARGUMENT_KEYS = {
     "input",
     "patch",
 }
+
+
+def validate_api_options(payload, dialect):
+    """Only public, typed API controls may bypass text masking."""
+    controls = {
+        "model",
+        "stream",
+        "store",
+        "parallel_tool_calls",
+        "max_output_tokens",
+        "max_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "background",
+        "truncation",
+        "reasoning",
+        "include",
+        "service_tier",
+        "stream_options",
+        "metadata",
+        "client_metadata",
+        "prompt_cache_key",
+        "safety_identifier",
+    }
+    content = {
+        "input",
+        "instructions",
+        "messages",
+        "tools",
+        "tool_choice",
+        "text",
+        "stop",
+    }
+    if set(payload) - controls - content:
+        raise ValueError("Unsupported API controls.")
+    for key in {
+        "stream",
+        "store",
+        "parallel_tool_calls",
+        "background",
+    } & payload.keys():
+        if not isinstance(payload[key], bool):
+            raise ValueError("API boolean controls must be booleans.")
+    for key in {
+        "max_output_tokens",
+        "max_tokens",
+        "max_completion_tokens",
+    } & payload.keys():
+        if type(payload[key]) is not int or payload[key] < 1:
+            raise ValueError("API token limits must be positive integers.")
+    for key in {"temperature", "top_p"} & payload.keys():
+        if type(payload[key]) not in {int, float} or not 0 <= payload[key] <= (
+            2 if key == "temperature" else 1
+        ):
+            raise ValueError("Invalid API sampling control.")
+    for key, allowed in {
+        "truncation": {"disabled"},
+        "service_tier": {"auto", "default", "flex", "priority"},
+    }.items():
+        if key in payload and (
+            not isinstance(payload[key], str) or payload[key] not in allowed
+        ):
+            raise ValueError("Unsupported API control enum.")
+    if "model" in payload and (
+        not isinstance(payload["model"], str)
+        or not re.fullmatch(r"[A-Za-z0-9_./:-]{1,200}", payload["model"])
+    ):
+        raise ValueError("Invalid model ID.")
+    if "reasoning" in payload:
+        reasoning = payload["reasoning"]
+        enums = {
+            "effort": {"none", "minimal", "low", "medium", "high", "xhigh"},
+            "summary": {"auto", "concise", "detailed"},
+        }
+        if (
+            not isinstance(reasoning, dict)
+            or set(reasoning) - enums.keys()
+            or any(
+                not isinstance(value, str) or value not in enums[key]
+                for key, value in reasoning.items()
+            )
+        ):
+            raise ValueError("Unsupported reasoning controls.")
+    if "include" in payload and (
+        not isinstance(payload["include"], list)
+        or any(item != "reasoning.encrypted_content" for item in payload["include"])
+    ):
+        raise ValueError("Unsupported API include fields.")
+    if "stop" in payload and not (
+        isinstance(payload["stop"], str)
+        or isinstance(payload["stop"], list)
+        and 1 <= len(payload["stop"]) <= 4
+        and all(isinstance(item, str) for item in payload["stop"])
+    ):
+        raise ValueError("Stop sequences must be text or a list of text.")
+    if dialect == "chat_completions" and set(payload) & {
+        "input",
+        "instructions",
+        "text",
+        "max_output_tokens",
+        "include",
+    }:
+        raise ValueError("Responses controls are unsupported in Chat Completions.")
+    if dialect == "responses" and set(payload) & {
+        "messages",
+        "stop",
+        "max_completion_tokens",
+        "max_tokens",
+        "stream_options",
+    }:
+        raise ValueError("Chat controls are unsupported in Responses.")
 
 
 class SharedEngine(MaskingEngine):
@@ -424,9 +537,7 @@ class GatewaySession:
                 output.append(
                     header
                     + "\n"
-                    + self._mask_source(
-                        body[:-3], header[3:].strip() or "auto"
-                    )
+                    + self._mask_source(body[:-3], header[3:].strip() or "auto")
                     + "```"
                 )
             elif part.startswith("`") and part.endswith("`") and len(part) > 1:
@@ -676,11 +787,40 @@ class GatewaySession:
                 result[key] = self.safeguards(item)
         return result
 
-    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if set(payload) - TOP_FIELDS:
+    def request(self, payload: dict[str, Any], *, dialect=None) -> dict[str, Any]:
+        fields = (
+            TOP_FIELDS | {"max_completion_tokens", "stop", "stream_options"}
+            if dialect == "chat_completions"
+            else TOP_FIELDS
+        )
+        if set(payload) - fields:
             raise ValueError("Unsupported request fields; request was not forwarded.")
         if payload.get("background") or payload.get("truncation") == "auto":
             raise ValueError("Background/server-side truncation is unsupported.")
+        if dialect in {"responses", "chat_completions"}:
+            validate_api_options(payload, dialect)
+            if "input" in payload and "messages" in payload:
+                raise ValueError("Mixed API dialects are unsupported.")
+            if dialect == "chat_completions" and "system" in payload:
+                raise ValueError(
+                    "Chat Completions uses system messages, not a system field."
+                )
+            options = payload.get("stream_options")
+            if options is not None and (
+                not isinstance(options, dict)
+                or set(options) - {"include_usage"}
+                or not isinstance(options.get("include_usage"), bool)
+            ):
+                raise ValueError("Unsupported stream options.")
+            for tool in payload.get("tools", []):
+                if not isinstance(tool, dict) or tool.get("type") != "function":
+                    raise ValueError(
+                        "API mode supports local function tools only; remote tools are blocked."
+                    )
+            if dialect == "responses" and "input" not in payload:
+                raise ValueError("Responses requires an input payload.")
+            if dialect == "chat_completions" and "messages" not in payload:
+                raise ValueError("Chat Completions requires messages.")
 
         # Seed code aliases before prompt references in this request.
         def seed(value):
@@ -727,6 +867,7 @@ class GatewaySession:
                 "tools",
                 "text",
                 "stop_sequences",
+                "stop",
                 "tool_choice",
                 "output_config",
                 "context_management",
@@ -741,6 +882,14 @@ class GatewaySession:
             result["store"] = False
             result["instructions"] = PRIVACY_INSTRUCTION + result.get(
                 "instructions", ""
+            )
+        elif "messages" in result and dialect == "chat_completions":
+            if "system" in result:
+                raise ValueError(
+                    "Chat Completions uses system messages, not a system field."
+                )
+            result["messages"].insert(
+                0, {"role": "system", "content": PRIVACY_INSTRUCTION}
             )
         elif "messages" in result:
             system = result.get("system", [])
@@ -789,7 +938,7 @@ class GatewaySession:
                 result.append(self.walk(block))
         return result
 
-    def response(self, body: bytes, content_type: str) -> bytes:
+    def response(self, body: bytes, content_type: str, *, dialect=None) -> bytes:
         if "text/event-stream" not in content_type:
             return json.dumps(
                 self.walk(json.loads(body), restore=True), ensure_ascii=False
@@ -810,6 +959,28 @@ class GatewaySession:
         thinking: dict[int, dict] = {}
         for index, (_, event) in enumerate(events):
             if not isinstance(event, dict):
+                continue
+            if dialect == "chat_completions":
+                for choice in event.get("choices", []):
+                    chat_delta = choice.get("delta", {})
+                    for field in ("content", "reasoning_content", "refusal"):
+                        if isinstance(chat_delta.get(field), str):
+                            groups.setdefault(
+                                ("chat", choice["index"], field), []
+                            ).append((index, chat_delta, field))
+                    for call in chat_delta.get("tool_calls", []):
+                        function = call.get("function", {})
+                        for field in ("name", "arguments"):
+                            if isinstance(function.get(field), str):
+                                groups.setdefault(
+                                    (
+                                        "chat_tool",
+                                        choice["index"],
+                                        call["index"],
+                                        field,
+                                    ),
+                                    [],
+                                ).append((index, function, field))
                 continue
             kind = event.get("type", "")
             delta = event.get("delta")
@@ -859,6 +1030,8 @@ class GatewaySession:
             field = group[0][2]
             if (
                 field == "partial_json"
+                or dialect == "chat_completions"
+                and field == "arguments"
                 or group[0][1].get("type") == "response.function_call_arguments.delta"
             ):
                 restored = json.dumps(
@@ -875,7 +1048,9 @@ class GatewaySession:
                     output.append("\n".join(lines) + "\n\n")
                 continue
             # Deltas have already been restored; do not recursively restore twice.
-            if event.get("type") not in {
+            if dialect == "chat_completions":
+                pass  # Chat delta text/names/arguments were restored above.
+            elif event.get("type") not in {
                 "content_block_delta",
                 "response.output_text.delta",
                 "response.function_call_arguments.delta",
@@ -904,15 +1079,17 @@ class PrivacyGateway(ThreadingHTTPServer):
         if address[0] != "127.0.0.1":
             raise ValueError("Gateway must bind to IPv4 loopback.")
         self.token = token
-        self.upstreams = dict(upstreams or UPSTREAMS)
+        self.upstreams = dict(UPSTREAMS if upstreams is None else upstreams)
         # Explicit API-key modes are opt-in at construction. They are never
         # enabled by subscription installation and never share credentials.
         self.api_upstreams = dict(api_upstreams or {})
         for agent, origin in self.api_upstreams.items():
             if agent not in API_AUTH_PREFIXES:
                 raise ValueError(f"Unsupported API mode: {agent}")
-            loopback = origin.startswith("http://127.0.0.1:")
-            if not origin.startswith("https://") and not loopback:
+            loopback = isinstance(origin, str) and re.fullmatch(
+                r"http://127\.0\.0\.1:[0-9]{1,5}", origin
+            )
+            if origin != API_UPSTREAMS[agent] and not loopback:
                 raise ValueError("API upstream must be a fixed HTTPS origin.")
             self.upstreams[agent] = origin
         self.sessions: dict[str, GatewaySession] = {}
@@ -942,9 +1119,7 @@ class PrivacyGateway(ThreadingHTTPServer):
                     current.opaque.clear()
                 del self.sessions[agent]
             path = (
-                self.state_dir / f"{agent}-symbols-v2.enc"
-                if self.state_dir
-                else None
+                self.state_dir / f"{agent}-symbols-v2.enc" if self.state_dir else None
             )
             saved = None
             if path and path.exists():
@@ -1027,8 +1202,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health" and self.authorized():
             self.send_body(200, b'{"service":"secure-mcp-subscription-gateway"}')
-        elif self.authorized() and re.fullmatch(
-            r"/codex/models(?:\?client_version=[\d.]+)?", self.path
+        elif (
+            self.authorized()
+            and re.fullmatch(r"/codex/models(?:\?client_version=[\d.]+)?", self.path)
+            and "codex" in self.server.upstreams
         ):
             auth = self.headers.get("Authorization", "")
             if not auth.startswith("Bearer eyJ") or self.headers.get("x-api-key"):
@@ -1096,6 +1273,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 b'{"error":"API mode is not enabled for this gateway instance"}',
             )
             return
+        if agent not in self.server.upstreams:
+            self.send_body(
+                400, b'{"error":"Provider is not enabled for this gateway instance"}'
+            )
+            return
         auth = self.headers.get("Authorization", "")
         if agent in API_AUTH_PREFIXES:
             # Explicit API mode: the caller's own API key is forwarded to the
@@ -1112,7 +1294,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not valid_auth or self.headers.get("x-api-key"):
             self.send_body(
                 401,
-                b'{"error":"Existing subscription OAuth login required; API keys refused"}',
+                b'{"error":"xAI API key required; subscription credentials refused"}'
+                if agent in API_AUTH_PREFIXES
+                else b'{"error":"Existing subscription OAuth login required; API keys refused"}',
             )
             return
         try:
@@ -1129,7 +1313,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             # Refresh stays CLI-owned; changing bearer tokens must not change aliases.
             session = self.server.get_session(agent)
             with session.lock:
-                masked = session.request(payload)
+                dialect = (
+                    "chat_completions"
+                    if path.endswith("/chat/completions")
+                    else "responses"
+                    if agent in API_AUTH_PREFIXES
+                    else None
+                )
+                masked = session.request(payload, dialect=dialect)
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": auth,
@@ -1138,14 +1329,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     else "application/json",
                 }
                 for key in (
-                    "anthropic-version",
-                    "anthropic-beta",
-                    "chatgpt-account-id",
-                    "OpenAI-Beta",
-                    "User-Agent",
-                    "originator",
-                    "session_id",
-                    "x-codex-beta-features",
+                    ()
+                    if agent in API_AUTH_PREFIXES
+                    else (
+                        "anthropic-version",
+                        "anthropic-beta",
+                        "chatgpt-account-id",
+                        "OpenAI-Beta",
+                        "User-Agent",
+                        "originator",
+                        "session_id",
+                        "x-codex-beta-features",
+                    )
                 ):
                     if self.headers.get(key):
                         headers[key] = self.headers[key]
@@ -1170,7 +1365,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         (b"event:", b"data:", b":")
                     ):
                         content_type = "text/event-stream"
-                    restored = session.response(body, content_type)
+                    restored = session.response(body, content_type, dialect=dialect)
                 self.server.save(agent, session)
                 self.send_body(200, restored, content_type)
         except urllib.error.HTTPError as exc:
@@ -1179,7 +1374,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             exc.close()
             self.send_body(
                 exc.code if exc.code in {401, 403, 429} else 502,
-                b'{"error":"Subscription upstream rejected the request"}',
+                b'{"error":"API upstream rejected the request"}'
+                if agent in API_AUTH_PREFIXES
+                else b'{"error":"Subscription upstream rejected the request"}',
             )
         except (ValueError, TypeError, KeyError, OSError, RecursionError):
             self.send_body(
