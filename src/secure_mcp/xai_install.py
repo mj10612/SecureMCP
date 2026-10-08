@@ -1,7 +1,6 @@
 """Explicit xAI API setup; never changes browser login or subscription settings."""
 
 import os
-import json
 from pathlib import Path
 import secrets
 
@@ -9,7 +8,11 @@ import tomlkit
 
 from secure_mcp.encrypted_session import session_file_lock
 from secure_mcp.gateway import validate_api_options
-from secure_mcp.gateway_install import apply_settings, load_config
+from secure_mcp.gateway_install import (
+    apply_settings,
+    load_config,
+    load_installation_manifest,
+)
 
 
 def default_api_config():
@@ -30,6 +33,9 @@ def install_api(path: Path, model: str, port=38118, grok_dir=None):
     if not 1024 <= port <= 65535:
         raise ValueError("Invalid API gateway port.")
     path = path.resolve()
+    manifest = path.parent / "installation.json"
+    if manifest.exists():
+        load_installation_manifest(manifest)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     with session_file_lock(path):
@@ -43,7 +49,9 @@ def install_api(path: Path, model: str, port=38118, grok_dir=None):
                 "provider": "xai",
             }
         )
-        manifest = path.parent / "installation.json"
+        records = (
+            load_installation_manifest(manifest)["files"] if manifest.exists() else {}
+        )
         if manifest.exists() and config["port"] != port:
             raise ValueError("Uninstall API mode before changing its port.")
         config["port"] = port
@@ -56,11 +64,6 @@ def install_api(path: Path, model: str, port=38118, grok_dir=None):
             else tomlkit.document()
         )
         models = value.setdefault("model", {})
-        records = (
-            json.loads(manifest.read_text(encoding="utf-8"))["files"]
-            if manifest.exists()
-            else {}
-        )
         if "secure_mcp_xai" in models and str(settings.resolve()) not in records:
             raise ValueError(
                 "The secure_mcp_xai model already exists; choose a clean configuration."

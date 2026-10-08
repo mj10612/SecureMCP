@@ -8,6 +8,9 @@ import re
 from secure_mcp.engine.code_parser import CodeParser, detect_language, literal_parts
 from secure_mcp.engine.grammar_en import EnglishGrammarEngine
 from secure_mcp.engine.grammar_ko import (
+    KOREAN_COPULA_LIST,
+    KOREAN_JOSA_LIST,
+    KOREAN_PLURAL,
     KoreanGrammarEngine,
     is_hangul_string,
     normalize_particle,
@@ -45,9 +48,7 @@ STRUCTURAL_KO = {"그리고", "그러나", "및", "또는", "하지만"}
 # Code number aliases are "732846" + 12 digits (see StrategyGenerator.generate).
 # Legacy dotted numbers (0.5 + .1) could glue two aliases with no separator.
 NUMERIC_ALIAS_LENGTH = 18
-NUMERIC_ALIAS_RUN = re.compile(
-    r"(?<![A-Za-z0-9_])(?:732846\d{12})+(?![A-Za-z0-9_])"
-)
+NUMERIC_ALIAS_RUN = re.compile(r"(?<![A-Za-z0-9_])(?:732846\d{12})+(?![A-Za-z0-9_])")
 
 
 class MaskingEngine:
@@ -192,16 +193,22 @@ class MaskingEngine:
             return self.tokenizer.tokenize(text)
         if "" in terms:
             raise ValueError("Sensitive terms must be nonempty.")
+        suffixes = set(KOREAN_JOSA_LIST) | set(KOREAN_COPULA_LIST)
+        suffixes.update(KOREAN_PLURAL + particle for particle in KOREAN_JOSA_LIST)
         pattern = re.compile(
-            r"(?<!\w)(?:"
+            r"(?<!\w)(?P<entity>"
             + "|".join(re.escape(s) for s in sorted(terms, key=len, reverse=True))
-            + r")(?!\w)"
+            + r")(?P<particle>"
+            + "|".join(re.escape(s) for s in sorted(suffixes, key=len, reverse=True))
+            + r")?(?!\w)"
         )
         output: list[TextChunk] = []
         cursor = 0
         for match in pattern.finditer(text):
             output.extend(self.tokenizer.tokenize(text[cursor : match.start()]))
-            output.append(TextChunk(match[0], "ENTITY"))
+            output.append(TextChunk(match["entity"], "ENTITY"))
+            if match["particle"]:
+                output.append(TextChunk(match["particle"], "PARTICLE"))
             cursor = match.end()
         output.extend(self.tokenizer.tokenize(text[cursor:]))
         return output
@@ -317,53 +324,47 @@ class MaskingEngine:
             count = 0
             unique: set[str] = set()
 
-            def restore(match: re.Match[str]) -> str:
-                nonlocal count
-                count += 1
-                key = match[1] if normalize_particles else match[0]
-                mapping = reverse_store[key]
-                unique.add(key)
-                suffix = match[2] or "" if normalize_particles else ""
-                return mapping.original + (
-                    normalize_particle(mapping.original, suffix) if suffix else ""
-                )
-
-            output = masked_text
             # Legacy masks could glue adjacent numeric aliases (0.5.1 -> two
             # aliases with no separator). Recover only runs that are exactly a
             # sequence of numeric aliases; foreign digit runs are left untouched.
             glued_unmatched: list[str] = []
 
-            def restore_glued(match: re.Match[str]) -> str:
+            def restore(match: re.Match[str]) -> str:
                 nonlocal count
-                run = match[0]
+                run = match["numeric"]
+                if run is None:
+                    key = match["alias"]
+                    mapping = reverse_store[key]
+                    count += 1
+                    unique.add(key)
+                    suffix = match.groupdict().get("particle") or ""
+                    return mapping.original + (
+                        normalize_particle(mapping.original, suffix) if suffix else ""
+                    )
                 pieces = []
                 for offset in range(0, len(run), NUMERIC_ALIAS_LENGTH):
                     chunk = run[offset : offset + NUMERIC_ALIAS_LENGTH]
-                    mapping = reverse_store.get(chunk)
-                    if mapping is None:
+                    numeric_mapping = reverse_store.get(chunk)
+                    if numeric_mapping is None:
                         glued_unmatched.append(chunk)
                         pieces.append(chunk)
                     else:
                         count += 1
                         unique.add(chunk)
-                        pieces.append(mapping.original)
+                        pieces.append(numeric_mapping.original)
                 return "".join(pieces)
 
-            output = NUMERIC_ALIAS_RUN.sub(restore_glued, output)
+            # Both forms are substituted from the original input in one pass:
+            # restored originals may themselves contain allocated aliases.
+            pattern = "(?P<numeric>" + NUMERIC_ALIAS_RUN.pattern + ")"
             if alternatives:
-                pattern = "|".join(alternatives)
+                pattern += "|(?P<alias>" + "|".join(alternatives) + ")"
                 if normalize_particles:
-                    pattern = (
-                        "("
-                        + pattern
-                        + r")((?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
-                    )
-                output = re.sub(pattern, restore, output)
+                    pattern += r"(?P<particle>(?:으로|이랑|이나|은|는|을|를|과|와|이|가|로|랑|나)(?:부터|도|만|는|의)?(?=\s|[.,!?]|$))?"
+            output = re.sub(pattern, restore, masked_text)
             candidates = StrategyGenerator.get_pattern(strategy).findall(masked_text)
             unmatched = sorted(
-                {c for c in candidates if c not in reverse_store}
-                | set(glued_unmatched)
+                {c for c in candidates if c not in reverse_store} | set(glued_unmatched)
             )
             if strict and unmatched:
                 raise ValueError(

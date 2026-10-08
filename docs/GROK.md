@@ -74,3 +74,12 @@ The real API smoke test defaults to skip. To run it intentionally, set
 `SECURE_MCP_LIVE_XAI_API=1`, `SECURE_MCP_XAI_MODEL` and `XAI_API_KEY` in the test
 process, then run `pytest tests/test_xai_api.py -k live_xai_api_smoke`.
 It consumes separately billed API usage, not a Grok subscription allowance.
+
+
+The explicit xAI gateway supports `GET /xai/v1/models`. Both the local
+`X-SecureMCP-Token` and caller-owned `Authorization: Bearer xai-...` are required.
+The gateway fetches only the fixed provider catalog, rejects redirects/environment proxies,
+and bounds JSON size. It returns public model IDs and bounded public metadata; arbitrary
+provider descriptions are omitted. This enables catalog discovery for compatibility probes;
+it does not certify Cursor/Cline or other untested hosts, and no generic `/v1/models`
+subscription route or credential fallback is enabled.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
 import secrets
+import re
 import plistlib
 import subprocess
 import sys
@@ -51,7 +53,48 @@ def load_config(path: Path):
     return config
 
 
-def healthy(config):
+def _parse_installation_manifest(data):
+    message = "Invalid installation manifest; restore/merge installation.json before retrying."
+    try:
+        manifest = json.loads(data)
+    except (ValueError, UnicodeError):
+        raise ValueError(message) from None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise ValueError(message)
+    if "uninstall_started" in manifest and not isinstance(
+        manifest["uninstall_started"], bool
+    ):
+        raise ValueError(message)
+    for name, record in manifest["files"].items():
+        if (
+            not isinstance(name, str)
+            or not Path(name).is_absolute()
+            or not isinstance(record, dict)
+        ):
+            raise ValueError(message)
+        original = record.get("original_hex")
+        digest = record.get("installed_sha256")
+        if (
+            "original_hex" not in record
+            or original is not None
+            and (
+                not isinstance(original, str)
+                or len(original) % 2
+                or not re.fullmatch(r"[0-9a-fA-F]*", original)
+            )
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(message)
+    return manifest
+
+
+def load_installation_manifest(path: Path):
+    """Validate every restore record before any host settings are changed."""
+    return _parse_installation_manifest(path.read_bytes())
+
+
+def _healthy_response(config):
     request = urllib.request.Request(
         f"http://127.0.0.1:{config['port']}/health",
         headers={"X-SecureMCP-Token": config["token"]},
@@ -60,13 +103,20 @@ def healthy(config):
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
             request, timeout=1
         ) as response:
+            value = json.load(response)
             return (
-                json.load(response).get("service") == "secure-mcp-subscription-gateway"
+                isinstance(value, dict)
+                and value.get("service") == "secure-mcp-subscription-gateway"
             )
+    except (OSError, ValueError, HTTPException):
+        return False
+
+
+def healthy(config):
+    try:
+        return _healthy_response(config)
     except urllib.error.HTTPError as exc:
         exc.close()
-        return False
-    except (OSError, ValueError):
         return False
 
 
@@ -129,18 +179,36 @@ def ensure_gateway(path: Path):
 
 
 def stop_gateway(path: Path):
+    if not path.exists():
+        return False
     config = load_config(path)
     if not healthy(config):
-        return
+        return False
     request = urllib.request.Request(
         f"http://127.0.0.1:{config['port']}/shutdown",
         data=b"",
         headers={"X-SecureMCP-Token": config["token"]},
     )
-    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
-        request, timeout=5
-    ):
-        pass
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            request, timeout=5
+        ) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        # An authenticated HTTP rejection is never a successful shutdown.
+        exc.close()
+        raise
+    except (HTTPException, OSError) as exc:
+        # The daemon can close its socket while acknowledging shutdown. Confirm
+        # that it actually disappeared rather than hiding a failed stop request.
+        deadline = time.monotonic() + 2
+        while _healthy_response(config):
+            if time.monotonic() >= deadline:
+                raise OSError(
+                    "Gateway remained active after an interrupted shutdown response."
+                ) from exc
+            time.sleep(0.05)
+    return True
 
 
 def install_gateway(
@@ -151,6 +219,10 @@ def install_gateway(
     codex_dir: Path | None = None,
     startup_path: Path | None = None,
 ):
+    path = path.resolve()
+    manifest_path = path.parent / "installation.json"
+    if manifest_path.exists():
+        load_installation_manifest(manifest_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with session_file_lock(path):
         return _install_gateway(path, agent, port, claude_dir, codex_dir, startup_path)
@@ -207,10 +279,12 @@ def startup_registration(arguments, startup_path=None):
 
 def _install_gateway(path: Path, agent, port, claude_dir, codex_dir, startup_path):
     path = path.resolve()
+    manifest_path = path.parent / "installation.json"
+    previous_manifest = (
+        load_installation_manifest(manifest_path) if manifest_path.exists() else None
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
-    manifest_path = path.parent / "installation.json"
-    previous_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
     config = (
         load_config(path)
         if path.exists()
@@ -302,7 +376,15 @@ def apply_settings(path: Path, config, changes):
     """Back up and transactionally apply settings, shared by subscription/API setup."""
     manifest_path = path.parent / "installation.json"
     previous_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
-    manifest = json.loads(previous_manifest) if previous_manifest else {"files": {}}
+    manifest = (
+        _parse_installation_manifest(previous_manifest)
+        if previous_manifest is not None
+        else {"files": {}}
+    )
+    if manifest.get("uninstall_started"):
+        raise ValueError(
+            "Uninstall recovery is incomplete; retry uninstall before installing."
+        )
     # Prepare and validate every file before any host settings are changed.
     for settings, data in changes.items():
         name = str(settings.resolve())
@@ -353,22 +435,56 @@ def apply_settings(path: Path, config, changes):
 
 
 def uninstall_gateway(path: Path):
+    path = path.resolve()
+    if not path.parent.exists():
+        return False
     manifest_path = path.parent / "installation.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest_path.exists():
+        load_installation_manifest(manifest_path)
+    with session_file_lock(path):
+        return _uninstall_gateway(path)
+
+
+def _uninstall_gateway(path: Path):
+    manifest_path = path.parent / "installation.json"
+    if not manifest_path.exists():
+        return False
+    manifest = load_installation_manifest(manifest_path)
+    recovering = manifest.get("uninstall_started") is True
+    originals = {}
     for name, record in manifest["files"].items():
         settings = Path(name)
-        if (
-            not settings.is_file()
-            or sha256(settings.read_bytes()).hexdigest() != record["installed_sha256"]
-        ):
+        original = (
+            bytes.fromhex(record["original_hex"])
+            if record["original_hex"] is not None
+            else None
+        )
+        originals[settings] = original
+        current = settings.read_bytes() if settings.is_file() else None
+        installed = (
+            current is not None
+            and sha256(current).hexdigest() == record["installed_sha256"]
+        )
+        restored = (
+            recovering
+            and current == original
+            and (current is not None or not settings.exists())
+        )
+        if not installed and not restored:
             raise ValueError(
                 "Host settings changed; refusing to overwrite them. Restore/merge installation.json manually."
             )
+    # Persist the recovery boundary before touching any settings. A failed or
+    # interrupted uninstall may retry files already restored to exact originals,
+    # while any other user edits still prevent overwriting them.
+    if not recovering:
+        manifest["uninstall_started"] = True
+        _atomic_json(manifest_path, manifest)
     stop_gateway(path)
-    for name, record in manifest["files"].items():
-        settings = Path(name)
-        if record["original_hex"] is None:
-            settings.unlink()
+    for settings, original in originals.items():
+        if original is None:
+            settings.unlink(missing_ok=True)
         else:
-            atomic_bytes(settings, bytes.fromhex(record["original_hex"]))
+            atomic_bytes(settings, original)
     manifest_path.unlink()
+    return True

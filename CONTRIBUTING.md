@@ -39,6 +39,17 @@ We are committed to providing a welcoming and inclusive environment for everyone
    python -m secure_mcp benchmark
    ```
 
+The default suite uses synthetic fixtures. Optional native-host fixtures require
+`SECURE_MCP_CLAUDE_BINARY`, `SECURE_MCP_CODEX_BINARY`, or
+`SECURE_MCP_GROK_BINARY` pointing to the relevant executable; these tests use
+isolated homes and local mock providers, without real provider inference.
+Antigravity configuration tests use `SECURE_MCP_AGY_BINARY` or `agy` on `PATH`.
+
+Live subscription tests require the explicit `SECURE_MCP_LIVE_SUBSCRIPTION=1`
+opt-in plus the relevant configured CLI and login. They call real services and
+can consume subscription quota. Leave that variable unset for ordinary local
+checks. The Antigravity live MCP handshake has the same opt-in requirement.
+
 ---
 
 ## Pull Request Guidelines

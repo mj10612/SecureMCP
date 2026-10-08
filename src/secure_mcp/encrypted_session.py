@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import errno
 import json
 import math
 import os
 import re
 from pathlib import Path
+import sys
 import tempfile
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -25,6 +27,7 @@ from secure_mcp.engine.strategies import mapping_key, StrategyGenerator
 
 _MAGIC = b"SecureMCP-session-v1\n"
 _SALT_SIZE = 16
+_LOCK_MAGIC = b"SecureMCP-native-lock-v1\n"
 
 
 class SessionExpiredError(ValueError):
@@ -40,7 +43,28 @@ def _cipher(password: str, salt: bytes) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8"))))
 
 
-def save_session(path: Path, session: PrivacySession, password: str) -> None:
+class SnapshotEncryption:
+    """One owner's derived key; each snapshot still gets fresh Fernet ciphertext.
+
+    Keep this context only for the owner's lifetime. It retains no password and
+    does not share encryption state with any other owner.
+    """
+
+    def __init__(self, password: str):
+        self._salt = os.urandom(_SALT_SIZE)
+        self._fernet = _cipher(password, self._salt)
+
+    def encrypt(self, payload: bytes) -> bytes:
+        return _MAGIC + self._salt + self._fernet.encrypt(payload)
+
+
+def save_session(
+    path: Path,
+    session: PrivacySession,
+    password: str,
+    *,
+    encryption: SnapshotEncryption | None = None,
+) -> None:
     """Atomically write an authenticated, password-encrypted session snapshot."""
     with session.operation():
         payload = {
@@ -61,13 +85,10 @@ def save_session(path: Path, session: PrivacySession, password: str) -> None:
                 m.model_dump(mode="json") for m in session.forward_store.values()
             ],
         }
-    salt = os.urandom(_SALT_SIZE)
-    encrypted = (
-        _MAGIC
-        + salt
-        + _cipher(password, salt).encrypt(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        )
+    # The opt-in context owns the encryption key; ordinary CLI snapshots keep
+    # their existing independent salt/key derivation per write.
+    encrypted = (encryption or SnapshotEncryption(password)).encrypt(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
     )
     fd, temporary = tempfile.mkstemp(prefix=".secure-mcp-", dir=path.parent)
     try:
@@ -177,16 +198,55 @@ def load_session(path: Path, password: str, session_id: str) -> PrivacySession:
 
 @contextmanager
 def session_file_lock(path: Path):
-    """Guard a CLI's complete read/modify/write sequence; fail on another writer."""
+    """Guard a transaction with a crash-released, nonblocking OS advisory lock.
+
+    The lock file is persistent: unlinking it can let concurrent processes lock
+    different inodes. Legacy empty O_EXCL locks require explicit safe migration.
+    """
+    path = path.resolve()
     lock = path.with_name(path.name + ".lock")
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        raise ValueError(
-            "Session file is in use. Retry after the other process finishes."
-        ) from None
+        fd = os.open(lock, os.O_RDWR)
+    except FileNotFoundError:
+        # Publish a fully initialized marker atomically. A crash between a bare
+        # O_CREAT and marker write would otherwise strand an ambiguous empty file.
+        initial_fd, temporary = tempfile.mkstemp(
+            prefix=".secure-mcp-lock-", dir=lock.parent
+        )
+        try:
+            with os.fdopen(initial_fd, "wb") as stream:
+                stream.write(_LOCK_MAGIC)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, lock)
+            except FileExistsError:
+                pass
+        finally:
+            os.unlink(temporary)
+        fd = os.open(lock, os.O_RDWR)
     try:
-        os.close(fd)
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise ValueError(
+                    "Session file is in use. Retry after the other process finishes."
+                ) from None
+            raise
+        if os.read(fd, len(_LOCK_MAGIC) + 1) != _LOCK_MAGIC:
+            raise ValueError(
+                "Legacy or unrecognized lock file: stop all old SecureMCP writers, "
+                f"then manually remove '{lock}' before retrying. "
+                "An active legacy writer cannot be distinguished safely from a crashed one."
+            )
         yield
     finally:
-        lock.unlink()
+        os.close(fd)  # The OS releases the lock, including on process termination.

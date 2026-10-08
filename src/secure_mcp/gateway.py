@@ -6,10 +6,12 @@ buffered so aliases split across events can be restored before local execution.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from copy import deepcopy
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import http.client
 from pathlib import Path
 import re
 import secrets
@@ -17,11 +19,20 @@ from threading import RLock
 from typing import Any
 import urllib.error
 import urllib.request
+import urllib.parse
 
 from secure_mcp.engine.masking_engine import MaskingEngine
 from secure_mcp.engine.strategies import mapping_key
-from secure_mcp.encrypted_session import SessionExpiredError, load_session, save_session
+from secure_mcp.encrypted_session import (
+    SessionExpiredError,
+    SnapshotEncryption,
+    load_session,
+    save_session,
+)
 from secure_mcp.hooks import _atomic_json
+from secure_mcp.gateway_validation import validate_request
+from secure_mcp.gateway_source import looks_like_source
+from secure_mcp.gateway_catalog import fetch_catalog
 from secure_mcp.models import MaskMode, SurrogateStrategy, TokenMapping, TokenType
 from secure_mcp.session import PrivacySession
 
@@ -165,10 +176,18 @@ PROTOCOL = {
 # JSON Schema keywords whose direct child names are aliased by walk().
 # A local `$ref` pointer keeps array indexes and all other keywords intact so
 # the masked reference still resolves inside the masked schema.
-SCHEMA_NAME_KEYWORDS = {"properties", "$defs", "definitions"}
+SCHEMA_NAME_KEYWORDS = {
+    "properties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "dependentRequired",
+    "dependencies",
+}
 # JSON data positions where protocol/schema exceptions must not apply:
 # enum/const/default/examples hold arbitrary data, not envelope metadata.
 DATA_KEYWORDS = {"enum", "const", "default", "examples"}
+SCHEMA_TYPES = {"object", "string", "number", "integer", "array", "boolean", "null"}
 TOOL_NAMES = {
     "Bash",
     "PowerShell",
@@ -388,6 +407,10 @@ def validate_api_options(payload, dialect):
 class SharedEngine(MaskingEngine):
     """One alias for an original in prompts, code, paths and tool results."""
 
+    def __init__(self, mapping_limit=100_000):
+        super().__init__()
+        self.mapping_limit = mapping_limit
+
     def _get_or_create_surrogate(
         self,
         original_token,
@@ -407,6 +430,10 @@ class SharedEngine(MaskingEngine):
             if key in mapping_store:
                 mapping_store[key].occurrence_count += 1
                 return mapping_store[key].surrogate
+            if len(mapping_store) >= self.mapping_limit:
+                raise ValueError(
+                    "Mapping limit reached; reset the gateway and start a new conversation."
+                )
             while True:
                 surrogate = generator.generate(kind, original_token, code=True)
                 if kind == TokenType.NUMBER:
@@ -430,13 +457,15 @@ class SharedEngine(MaskingEngine):
 
 
 class GatewaySession:
-    def __init__(self, session=None):
+    def __init__(self, session=None, mapping_limit=100_000):
         self.session = session or PrivacySession(
             "gateway", strategy=SurrogateStrategy.UNICODE, ttl_seconds=86400
         )
-        self.engine = SharedEngine()
+        self.engine = SharedEngine(mapping_limit)
         self.lock = RLock()
         self.opaque: set[str] = set()
+        self.active_requests = 0
+        self.encryption: SnapshotEncryption | None = None
 
     def _opaque_key(self, block):
         stable = {
@@ -490,17 +519,9 @@ class GatewaySession:
             return self._mask_prose(text, preserve_task_words=False)
 
     def mask(self, text: str, code: bool = False, language: str = "auto") -> str:
-        s = self.session
-        if len(s.forward_store) > 100_000:
-            raise ValueError(
-                "Mapping limit reached; start a new local gateway session."
-            )
         if code:
             return self._mask_source(text, language)
-        if "```" not in text and re.search(
-            r"(?m)^\s*(?:async\s+def\s|def\s|class\s|function\s|const\s|let\s|var\s|package\s|func\s|fn\s|pub\s+fn\s|#\s*include\b|SELECT\s|[\w]+\s*=(?!=))",
-            text,
-        ):
+        if "```" not in text and looks_like_source(text):
             return self.mask(text, code=True)
         # Fenced/inline source is lexed, rather than replaced as an opaque block.
         parts = re.split(
@@ -688,7 +709,20 @@ class GatewaySession:
                 result[key] = self.walk(item, restore, code=True)
             elif key == "content" and kind == "tool_result":
                 result[key] = self.walk(item, restore, code=True)
-            elif key in {"properties", "$defs", "definitions"}:
+            elif (key == "patternProperties" and item) or (
+                key == "pattern" and isinstance(item, str) and kind in SCHEMA_TYPES
+            ):
+                raise ValueError(
+                    "JSON Schema pattern constraints cannot safely preserve private names."
+                )
+            elif key in {"parameters", "input_schema", "schema"} and isinstance(
+                item, (dict, bool)
+            ):
+                self.validate_schema(item)
+                result[key] = self.walk(item, restore)
+            elif key in SCHEMA_NAME_KEYWORDS:
+                if not isinstance(item, dict):
+                    raise ValueError("Schema name maps must be objects.")
                 result[key] = {
                     (
                         self.restore(k)
@@ -696,7 +730,12 @@ class GatewaySession:
                         else k
                         if k in ARGUMENT_KEYS
                         else self.mask(k, code=True)
-                    ): self.walk(v, restore)
+                    ): (
+                        [self.schema_name(name, restore) for name in v]
+                        if key in {"dependentRequired", "dependencies"}
+                        and isinstance(v, list)
+                        else self.walk(v, restore)
+                    )
                     for k, v in item.items()
                 }
             elif key == "required":
@@ -737,13 +776,54 @@ class GatewaySession:
                 # and schema exceptions must not apply inside them, or private
                 # values under keys like id/type/model/cache_control leak.
                 result[key] = self.walk_data(item, restore)
-            elif key == "additionalProperties" and isinstance(item, dict):
-                result[key] = self.walk(item, restore, code)
-            elif key == "strict":
-                result[key] = self.walk(item, restore, code)
             else:
                 result[key] = self.walk(item, restore, code)
         return result
+
+    def schema_name(self, name, restore=False):
+        if not isinstance(name, str):
+            raise ValueError("Schema property names must be text.")
+        return (
+            self.restore(name)
+            if restore
+            else name
+            if name in ARGUMENT_KEYS
+            else self.mask(name, code=True)
+        )
+
+    def validate_schema(self, schema):
+        if isinstance(schema, bool):
+            return
+        if not isinstance(schema, dict):
+            raise ValueError("Schema must be an object or boolean.")
+        if schema.get("patternProperties") or "pattern" in schema:
+            raise ValueError("JSON Schema pattern constraints are unsupported.")
+        for key, item in schema.items():
+            if key in SCHEMA_NAME_KEYWORDS and key != "dependentRequired":
+                if not isinstance(item, dict):
+                    raise ValueError("Schema name maps must be objects.")
+                for child in item.values():
+                    if key == "dependencies" and isinstance(child, list):
+                        continue
+                    self.validate_schema(child)
+            elif key in {
+                "items",
+                "additionalProperties",
+                "unevaluatedProperties",
+                "contains",
+                "not",
+                "if",
+                "then",
+                "else",
+                "propertyNames",
+            }:
+                for child in item if isinstance(item, list) else [item]:
+                    self.validate_schema(child)
+            elif key in {"allOf", "anyOf", "oneOf", "prefixItems"}:
+                if not isinstance(item, list):
+                    raise ValueError("Schema alternatives must be arrays.")
+                for child in item:
+                    self.validate_schema(child)
 
     def walk_data(self, value, restore=False):
         """Mask/restore arbitrary JSON data (enum/const/default/examples).
@@ -788,6 +868,9 @@ class GatewaySession:
         return result
 
     def request(self, payload: dict[str, Any], *, dialect=None) -> dict[str, Any]:
+        validate_request(
+            payload, dialect or ("claude" if "messages" in payload else "codex")
+        )
         fields = (
             TOP_FIELDS | {"max_completion_tokens", "stop", "stream_options"}
             if dialect == "chat_completions"
@@ -943,7 +1026,7 @@ class GatewaySession:
             return json.dumps(
                 self.walk(json.loads(body), restore=True), ensure_ascii=False
             ).encode()
-        events = []
+        events: list[tuple[list[str], dict[str, Any] | None]] = []
         for frame in re.split(r"\r?\n\r?\n", body.decode("utf-8")):
             # SSE line endings do not include Unicode separators inside JSON strings.
             lines = frame.replace("\r\n", "\n").split("\n")
@@ -953,23 +1036,41 @@ class GatewaySession:
             if not data or data == "[DONE]":
                 events.append((lines, None))
             else:
-                events.append((lines, json.loads(data)))
+                event = json.loads(data)
+                if not isinstance(event, dict):
+                    raise ValueError("SSE events must be JSON objects.")
+                events.append((lines, event))
         # Fold each text/JSON stream before restoration (tokens can span any delta).
         groups: dict[tuple, list[tuple[int, dict, str]]] = {}
         thinking: dict[int, dict] = {}
+        key: tuple
         for index, (_, event) in enumerate(events):
             if not isinstance(event, dict):
                 continue
             if dialect == "chat_completions":
-                for choice in event.get("choices", []):
+                choices = event.get("choices", [])
+                if not isinstance(choices, list):
+                    raise ValueError("Invalid Chat Completions choices.")
+                for choice in choices:
+                    if not isinstance(choice, dict) or not isinstance(choice.get("index"), int):
+                        raise ValueError("Invalid Chat Completions choice.")
                     chat_delta = choice.get("delta", {})
+                    if not isinstance(chat_delta, dict):
+                        raise ValueError("Invalid Chat Completions delta.")
+                    calls = chat_delta.get("tool_calls", [])
+                    if not isinstance(calls, list):
+                        raise ValueError("Invalid Chat Completions tool calls.")
                     for field in ("content", "reasoning_content", "refusal"):
                         if isinstance(chat_delta.get(field), str):
                             groups.setdefault(
                                 ("chat", choice["index"], field), []
                             ).append((index, chat_delta, field))
-                    for call in chat_delta.get("tool_calls", []):
+                    for call in calls:
+                        if not isinstance(call, dict) or not isinstance(call.get("index"), int):
+                            raise ValueError("Invalid Chat Completions tool call.")
                         function = call.get("function", {})
+                        if not isinstance(function, dict):
+                            raise ValueError("Invalid Chat Completions function.")
                         for field in ("name", "arguments"):
                             if isinstance(function.get(field), str):
                                 groups.setdefault(
@@ -1034,8 +1135,13 @@ class GatewaySession:
                 and field == "arguments"
                 or group[0][1].get("type") == "response.function_call_arguments.delta"
             ):
-                restored = json.dumps(
-                    self.values(json.loads(combined), restore=True), ensure_ascii=False
+                restored = (
+                    combined
+                    if not combined.strip()
+                    else json.dumps(
+                        self.values(json.loads(combined), restore=True),
+                        ensure_ascii=False,
+                    )
                 )
             else:
                 restored = self.restore(combined)
@@ -1075,9 +1181,17 @@ class PrivacyGateway(ThreadingHTTPServer):
         upstreams=None,
         state_dir: Path | None = None,
         api_upstreams=None,
+        mapping_limit=100_000,
     ):
         if address[0] != "127.0.0.1":
             raise ValueError("Gateway must bind to IPv4 loopback.")
+        if (
+            not isinstance(mapping_limit, int)
+            or isinstance(mapping_limit, bool)
+            or mapping_limit < 1
+        ):
+            raise ValueError("Mapping limit must be a positive integer.")
+        self.mapping_limit = mapping_limit
         self.token = token
         self.upstreams = dict(UPSTREAMS if upstreams is None else upstreams)
         # Explicit API-key modes are opt-in at construction. They are never
@@ -1094,6 +1208,7 @@ class PrivacyGateway(ThreadingHTTPServer):
             self.upstreams[agent] = origin
         self.sessions: dict[str, GatewaySession] = {}
         self.sessions_lock = RLock()
+        self.provider_locks = {agent: RLock() for agent in self.upstreams}
         self.state_dir = state_dir
         if state_dir:
             state_dir.mkdir(parents=True, exist_ok=True)
@@ -1101,14 +1216,13 @@ class PrivacyGateway(ThreadingHTTPServer):
         super().__init__(address, GatewayHandler)
 
     def get_session(self, agent):
-        with self.sessions_lock:
+        with self.provider_locks[agent]:
             current = self.sessions.get(agent)
             if current is not None:
                 # Serialize with an in-flight request before dropping state.
                 with current.lock:
-                    if (
-                        not current.session.generator.closed
-                        and not current.session.is_expired()
+                    if not current.session.generator.closed and (
+                        current.active_requests or not current.session.is_expired()
                     ):
                         return current
                     # An always-on daemon must apply the same idle TTL as a
@@ -1117,6 +1231,7 @@ class PrivacyGateway(ThreadingHTTPServer):
                     # them via save().
                     current.session.clear()
                     current.opaque.clear()
+                    current.encryption = None
                 del self.sessions[agent]
             path = (
                 self.state_dir / f"{agent}-symbols-v2.enc" if self.state_dir else None
@@ -1127,7 +1242,7 @@ class PrivacyGateway(ThreadingHTTPServer):
                     saved = load_session(path, self.token, "gateway")
                 except SessionExpiredError:
                     saved = None
-            session = GatewaySession(saved)
+            session = GatewaySession(saved, self.mapping_limit)
             # Reasoning provenance is only meaningful while the matching alias
             # table is alive. Expired/missing snapshots start fresh, so stale
             # digests must not be loaded into the new table.
@@ -1145,7 +1260,7 @@ class PrivacyGateway(ThreadingHTTPServer):
             return session
 
     def save(self, agent, session):
-        if session.session.is_expired():
+        if session.session.is_expired() and not session.active_requests:
             # Do not revive an expired session via touch(). Drop its aliases
             # and provenance; the next get_session() replaces the registry
             # entry after its own expiry check, so no registry lock is taken
@@ -1156,9 +1271,39 @@ class PrivacyGateway(ThreadingHTTPServer):
         session.session.touch()
         if self.state_dir:
             path = self.state_dir / f"{agent}-symbols-v2.enc"
-            save_session(path, session.session, self.token)
+            if session.encryption is None:
+                session.encryption = SnapshotEncryption(self.token)
+            save_session(
+                path, session.session, self.token, encryption=session.encryption
+            )
             _atomic_json(path.with_suffix(".opaque.json"), sorted(session.opaque))
             path.with_suffix(".opaque.json").chmod(0o600)
+
+    def reset(self, agent="all"):
+        agents = sorted(self.upstreams) if agent == "all" else [agent]
+        if any(name not in self.upstreams for name in agents):
+            raise ValueError("Unknown provider.")
+        with ExitStack() as stack:
+            for name in agents:
+                stack.enter_context(self.provider_locks[name])
+            current = [(name, self.sessions.get(name)) for name in agents]
+            for _, session in current:
+                if session is not None:
+                    stack.enter_context(session.lock)
+                    if session.active_requests:
+                        raise ValueError(
+                            "Provider has active requests; retry after they finish."
+                        )
+            for name, session in current:
+                if self.state_dir:
+                    path = self.state_dir / f"{name}-symbols-v2.enc"
+                    path.unlink(missing_ok=True)
+                    path.with_suffix(".opaque.json").unlink(missing_ok=True)
+                if session is not None:
+                    session.session.clear()
+                    session.opaque.clear()
+                    session.encryption = None
+                    del self.sessions[name]
 
     def server_close(self):
         super().server_close()
@@ -1166,6 +1311,7 @@ class PrivacyGateway(ThreadingHTTPServer):
             with session.lock:
                 session.session.clear()
                 session.opaque.clear()
+                session.encryption = None
         self.sessions.clear()
 
 
@@ -1200,6 +1346,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
+        if self.path == "/xai/v1/models":
+            if not self.authorized():
+                self.send_body(401, b'{"error":"Unauthorized"}')
+                return
+            if "xai" not in self.server.api_upstreams:
+                self.send_body(400, b'{"error":"Explicit API mode required"}')
+                return
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith(API_AUTH_PREFIXES["xai"]) or self.headers.get("x-api-key"):
+                self.send_body(401, b'{"error":"xAI API key required"}')
+                return
+            try:
+                body = fetch_catalog(self.server.api_upstreams["xai"], auth)
+                self.send_body(200, body)
+            except urllib.error.HTTPError as exc:
+                self.capture_response_headers(exc.headers)
+                status, body = sanitized_upstream_error(exc)
+                self.send_body(status, body)
+            except (ValueError, OSError, http.client.HTTPException):
+                self.send_body(502, b'{"error":"Model catalog unavailable"}')
+            return
         if self.path == "/health" and self.authorized():
             self.send_body(200, b'{"service":"secure-mcp-subscription-gateway"}')
         elif (
@@ -1253,6 +1420,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_body(200, b'{"stopping":true}')
             Thread(target=self.server.shutdown, daemon=True).start()
             return
+        if self.path == "/reset":
+            try:
+                if self.headers.get("Transfer-Encoding") or self.headers.get(
+                    "Content-Encoding"
+                ):
+                    raise ValueError("Unsupported encoding.")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024:
+                    raise ValueError("Invalid reset request.")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict) or set(payload) - {"agent"}:
+                    raise ValueError("Invalid reset request.")
+                agent = payload.get("agent", "all")
+                if not isinstance(agent, str):
+                    raise ValueError("Invalid provider.")
+                self.server.reset(agent)
+                self.send_body(200, b'{"reset":true}')
+            except (ValueError, OSError):
+                self.send_body(
+                    409,
+                    b'{"error":"Reset refused; stop active requests and retry with a valid provider"}',
+                )
+            return
         routes = {
             "/claude/v1/messages": ("claude", "/v1/messages"),
             "/claude/v1/messages/count_tokens": ("claude", "/v1/messages/count_tokens"),
@@ -1260,7 +1450,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "/xai/v1/responses": ("xai", "/v1/responses"),
             "/xai/v1/chat/completions": ("xai", "/v1/chat/completions"),
         }
-        route = routes.get(self.path.split("?", 1)[0])
+        request_path, _, query = self.path.partition("?")
+        if not supported_query(query):
+            self.send_body(400, b'{"error":"Unsupported query parameters; no request forwarded"}')
+            return
+        route = routes.get(request_path)
         if not route:
             self.send_body(
                 400, b'{"error":"Unsupported endpoint; no request forwarded"}'
@@ -1321,6 +1515,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     else None
                 )
                 masked = session.request(payload, dialect=dialect)
+                session.active_requests += 1
+                session.session.touch()
+            try:
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": auth,
@@ -1345,7 +1542,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     if self.headers.get(key):
                         headers[key] = self.headers[key]
                 request = urllib.request.Request(
-                    self.server.upstreams[agent] + path,
+                    self.server.upstreams[agent] + path + ("?" + query if query else ""),
                     data=json.dumps(masked, ensure_ascii=False).encode(),
                     headers=headers,
                 )
@@ -1365,24 +1562,123 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         (b"event:", b"data:", b":")
                     ):
                         content_type = "text/event-stream"
-                    restored = session.response(body, content_type, dialect=dialect)
-                self.server.save(agent, session)
+                    with session.lock:
+                        restored = session.response(body, content_type, dialect=dialect)
+                        self.server.save(agent, session)
                 self.send_body(200, restored, content_type)
+            finally:
+                with session.lock:
+                    session.active_requests -= 1
         except urllib.error.HTTPError as exc:
-            # Preserve 401 so the CLI can refresh its own OAuth token. Never echo provider errors.
             self.capture_response_headers(exc.headers)
-            exc.close()
-            self.send_body(
-                exc.code if exc.code in {401, 403, 429} else 502,
-                b'{"error":"API upstream rejected the request"}'
-                if agent in API_AUTH_PREFIXES
-                else b'{"error":"Subscription upstream rejected the request"}',
-            )
-        except (ValueError, TypeError, KeyError, OSError, RecursionError):
+            status, body = sanitized_upstream_error(exc)
+            self.send_body(status, body)
+        except (
+            ValueError,
+            TypeError,
+            KeyError,
+            OSError,
+            RecursionError,
+            http.client.HTTPException,
+        ):
             self.send_body(
                 400,
                 b'{"error":"Privacy gateway could not safely process this request; nothing bypassed masking"}',
             )
+
+
+def supported_query(query):
+    if not query:
+        return True
+    if len(query) > 256:
+        return False
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    if len({key for key, _ in pairs}) != len(pairs):
+        return False
+    return all(
+        (key == "beta" and value in {"true", "false"})
+        or (key == "client_version" and re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}", value))
+        or (key == "api-version" and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value))
+        for key, value in pairs
+    )
+
+
+PUBLIC_ERROR_TYPES = {
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "not_found_error",
+    "rate_limit_error",
+    "api_error",
+    "overloaded_error",
+}
+PUBLIC_ERROR_CODES = {
+    "context_length_exceeded",
+    "rate_limit_exceeded",
+    "model_not_found",
+    "invalid_api_key",
+    "insufficient_quota",
+    "server_error",
+    "invalid_request",
+    "request_too_large",
+    "overloaded_error",
+}
+UPSTREAM_ERROR_STATUSES = {
+    400,
+    401,
+    403,
+    404,
+    408,
+    413,
+    422,
+    429,
+    500,
+    502,
+    503,
+    504,
+    529,
+}
+
+
+def sanitized_upstream_error(exc):
+    status = exc.code if exc.code in UPSTREAM_ERROR_STATUSES else 502
+    error = {"message": "Upstream rejected the request."}
+    try:
+        body = exc.read(LIMIT + 1)
+        if len(body) <= LIMIT:
+            payload = json.loads(body)
+            upstream = payload.get("error", {}) if isinstance(payload, dict) else {}
+            if isinstance(upstream, dict):
+                # Anthropic supplies this condition as a 400 message, without
+                # a machine-readable code. Classify only the fixed prefix;
+                # never echo token counts, filenames or other upstream text.
+                message = upstream.get("message")
+                if (
+                    status == 400
+                    and upstream.get("type") == "invalid_request_error"
+                    and isinstance(message, str)
+                    and re.match(r"\Aprompt is too long(?:\s*:|\s*;|\s*$)", message, re.IGNORECASE)
+                ):
+                    error["code"] = "context_length_exceeded"
+                for field, allowed in (
+                    ("type", PUBLIC_ERROR_TYPES),
+                    ("code", PUBLIC_ERROR_CODES),
+                ):
+                    value = upstream.get(field)
+                    if isinstance(value, str) and value in allowed:
+                        error[field] = value
+    except (ValueError, OSError, http.client.HTTPException):
+        pass
+    finally:
+        exc.close()
+    if status == 413 or error.get("code") == "context_length_exceeded":
+        error["message"] = (
+            "Prompt is too long; reduce context or compact the conversation."
+        )
+    return status, json.dumps({"error": error}).encode()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

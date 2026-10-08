@@ -1,8 +1,8 @@
-# Antigravity 연결과 검증 범위
+﻿# Antigravity 연결과 검증 범위
 
-검증일: 2026-10-07. 로컬 환경: Windows 11 build 26200,
+검증일: 2026-10-08. 로컬 환경: Windows 11 build 26200,
 Antigravity CLI `agy --version` = `1.3.0`, Python 3.11.
-SDK 로컬 endpoint probe는 `google-antigravity==0.1.20`을 별도 환경에서 사용했다.
+SDK native tool 계약은 `google-antigravity==0.1.21`을 별도 환경에서 사용했다.
 
 ## CLI의 stdio MCP 연결
 
@@ -47,39 +47,95 @@ Gemini 추론 요청 전체를 자동 보호하지 않는다. 모델이 `mask_te
 그 도구의 원문 인자는 이미 제공자에게 보일 수 있다. 전체 게이트웨이 지원으로
 표시하지 않는다. 기본 Gemini 구독의 endpoint 변경이나 인증 재사용을 제공하지 않는다.
 
-## SDK endpoint 조사
+## SDK의 보호된 xAI API 연결
 
+검증 버전: `google-antigravity==0.1.21`, Python 3.11, Windows 11 build 26200.
 [공식 SDK local-models 문서](https://antigravity.google/docs/sdk/local-models/)의
-`LocalOpenAIAgentConfig(model=..., base_url=...)`는 로컬 OpenAI 호환 endpoint를
-사용한다. SDK 0.1.20을 실제 실행하고 loopback HTTP fixture로 요청을 받은 결과:
+`LocalOpenAIAgentConfig(model=..., base_url=...)`를 사용한다. 이 경로는
+**명시적인 xAI API 모드**이며 Gemini 구독을 재사용하지 않는다. 외부 xAI
+연결에는 사용자 API key와 xAI의 별도 요금이 적용된다. offline fixture는
+loopback 서버만 사용하며 결제나 실제 제공자 호출이 없다.
 
-- 경로: `/v1/chat/completions`, `stream: true`.
-- 요청 필드: `model`, `messages`, `tools`, `tool_choice`, `max_completion_tokens`, `stream`.
-- fixture의 HTTP 400은 SDK 실행 오류로 전달된다.
-
-이 검증은 자격증명 없이 로컬 서버만 사용했다. SDK가 endpoint override를
-지원한다는 증거이며, 기본 IDE/CLI Gemini 구독의 전송 경로가 같다는 증거는 아니다.
-로컬 fixture 비용은 없다. 외부 제공자로 연결할 경우 해당 제공자의 인증 및
-요금 조건을 적용해야 하며 기존 Gemini 구독 자격증명을 임의 재사용하면 안 된다.
-
-아직 SDK 게이트웨이 지원을 완료하지 않았다. 실제 SDK의 도구 호출/결과,
-stream 이벤트, 인증 헤더, compaction 요청 전체를 fixture로 수집하고 허용
-스키마를 검증해야 한다. 이후 영어·한국어 질문 → 파일 읽기 → 제공자 payload
-마스킹 → 로컬 답변/도구 인자 복원 계약을 통과해야 지원을 주장할 수 있다.
-
-직접 연결의 구체적 장애물은 인증 헤더 설정이다. SDK 0.1.20의
-[`LocalOpenAIAgentConfig` 구현](https://github.com/google-antigravity/antigravity-sdk-python/blob/main/google/antigravity/connections/local/local_openai_connection_config.py)은
-`ModelTarget`에서도 이름과 base_url만 추출하며, 실제
+SDK 0.1.21은 실제 `/v1/chat/completions` streaming 요청을 사용하지만,
+[`LocalOpenAIAgentConfig` 구현](https://github.com/google-antigravity/antigravity-sdk-python/blob/main/google/antigravity/connections/local/local_openai_connection_config.py)과
 [`LocalOpenAIConnectionStrategy`](https://github.com/google-antigravity/antigravity-sdk-python/blob/main/google/antigravity/connections/local/local_openai_connection.py)는
-`GemmaEndpoint(base_url=...)`만 만든다. custom inference HTTP header/API key
-설정은 제공하지 않는다. 실제 요청에도 SecureMCP 로컬 토큰 헤더가 없다.
-따라서 gateway가 필수로 요구하는 `X-SecureMCP-Token`과 제공자 인증을
-지원된 SDK API로 함께 전달하는 경로를 아직 확보하지 못했다. 연결을 위해
-로컬 토큰 인증을 제거하지 않는다. SDK의 공식 header 지원 또는 인증과
-세션 소유권을 보존하는 별도의 검증된 통합이 선행되어야 한다.
+`GemmaEndpoint(base_url=...)`만 전달한다. 따라서 mandatory gateway header를
+설정하기 위해 SecureMCP의 context helper를 사용한다.
+
+```python
+import asyncio
+import os
+from pathlib import Path
+
+from google.antigravity import Agent, LocalOpenAIAgentConfig
+from secure_mcp.antigravity_sdk import antigravity_endpoint
+from secure_mcp.xai_install import default_api_config, load_api_config
+
+async def main():
+    # 먼저 명시적인 xAI API gateway를 api-run으로 실행한다.
+    config = load_api_config(default_api_config())
+    api_key = os.environ["XAI_API_KEY"]
+    with antigravity_endpoint(
+        f"http://127.0.0.1:{config['port']}", config["token"], api_key
+    ) as base_url:
+        sdk_config = LocalOpenAIAgentConfig(
+            model=os.environ["XAI_MODEL"], base_url=base_url,
+            workspaces=[str(Path.cwd())],
+            # SDK 자식 프로세스에 ambient API key를 전달하지 않는다.
+            env={"XAI_API_KEY": ""},
+        ).lightweight()
+        async with Agent(sdk_config) as agent:
+            response = await agent.chat("Read fixture.py and review the code.")
+            async for token in response:
+                print(token, end="", flush=True)
+
+asyncio.run(main())
+```
+
+API gateway 설정과 실행은 [GATEWAY.md](GATEWAY.md)의 API 모드를 참고한다.
+SDK는 optional dependency이므로 프로젝트의 기본 의존성을 바꾸지 않는다.
+SDK 실행 환경에 `google-antigravity==0.1.21`을 별도로 설치한다.
+기존 SDK tool policy·작업 공간·local history 설정은 호출자가 유지한다.
+helper는 sandbox나 도구 권한을 승인하지 않는다.
+
+### 인증·수명·지원 범위
+
+helper는 context 동안만 IPv4 loopback listener를 실행한다. `base_url` 안의
+무작위 256-bit capability는 bearer secret이다. 공유하거나 로깅하지 않는다.
+listener는 capability를 constant-time 비교로 검증한 뒤에만 body를 읽으며,
+`POST /v1/chat/completions`만 허용한다. 이 capability는 helper의 메모리에만
+존재하고 helper는 설정 파일에 저장하지 않는다. SDK에 전달되는 설정도
+일시적이므로 context 종료 후 URL은 사용할 수 없다. 예외가 발생해도 listener와
+요청 worker를 닫는다.
+
+helper는 SDK에 gateway token이나 제공자 key를 전달하지 않는다. 승인된 요청만
+고정된 local gateway `/xai/v1/chat/completions`로 전달하며, 이때 gateway가
+필수로 요구하는 `X-SecureMCP-Token`과 xAI 인증을 포함한다. gateway에서 마스킹한
+payload만 고정 xAI origin으로 나간다. 자동 재시도, proxy 환경변수 사용,
+redirect, 직접 제공자 fallback은 없다. 요청/응답 크기를 제한하고 오류 본문은
+generic 메시지로 대체하여 token·provider 오류·원문이 SDK 로그에 반사되지 않는다.
+
+영어·한국어 offline 계약은 실제 SDK native `view_file` 호출로 임시 source를
+읽는다. provider fixture에서 두 요청의 private 함수명·변수명·이메일 부재를
+검증하며, 분할 SSE tool 이름/JSON 인자 복원으로 실제 파일 읽기가 실행되고,
+분할 SSE 답변이 로컬 SDK에 원래 이메일로 복원된다. SDK local history fixture에
+capability가 저장되지 않는 것도 확인한다. SDK의 native JSON Schema와 tool
+인자는 이 계약에 포함된다.
+
+잘못된 capability·gateway token, unknown top-level payload, encoded/oversized
+요청, 지원하지 않는 compaction control과 `/responses/compact`는 forwarding 없이
+거절한다. SDK가 일반 Chat Completions 메시지로 보내는 문맥은 동일한 마스킹
+경계를 사용하지만, 별도 opaque compaction protocol은 지원하지 않는다.
+Gemini IDE/CLI 기본 구독 추론은 자동 redirect되지 않으며 기존 stdio MCP utility
+범위를 유지한다.
+
+이 helper는 SDK의 별도 telemetry·crash report·SDK 자체의 local history를
+제어하지 않는다. capability URL을 SDK debug logging에 노출하지 않도록 SDK
+설정을 검토하고, 제공자 key가 ambient 환경변수에 있다면 위 예제처럼 SDK
+환경에서 비운다. Gemini/Antigravity login cache를 읽거나 저장하거나 재사용하지 않는다.
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/test_antigravity_host.py -q
-# SDK probe를 포함하는 별도 환경 (기본 프로젝트 의존성은 변경하지 않음)
-uv run --isolated --with google-antigravity==0.1.20 --with pytest --with pytest-asyncio python -m pytest tests/test_antigravity_host.py -q
+# 실제 SDK와 native tool 계약을 포함한 별도 환경
+uv run --isolated --with google-antigravity==0.1.21 --with pytest --with pytest-asyncio python -m pytest tests/test_antigravity_host.py -q
 ```

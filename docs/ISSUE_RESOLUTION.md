@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [#67](https://github.com/mj10612/SecureMCP/issues/67) | Versioned host/OS/auth/cost/scope table; shared Claude/Codex/xAI contract checks actual reads, bilingual aliases, schemas, split SSE, status codes, refreshed credentials and isolated encrypted state; offline suite runs in CI | Unverified hosts remain explicit candidates; live inference is opt-in |
 | [#66](https://github.com/mj10612/SecureMCP/issues/66) | Separate API install/run/uninstall, fixed xAI origin, original settings/login preservation, token/state/auth isolation; actual Grok 1.0.46 English/Korean file-read and split SSE fixtures; API control leakage and model-collision regression coverage | Live paid API checks require separate opt-in; browser subscription reuse is unverified and unsupported |
-| [#65](https://github.com/mj10612/SecureMCP/issues/65) | Actual Antigravity CLI 1.3.0 stdio config, conflict/preservation/space-path tests, initialize/list/tools handshake; SDK 0.1.20 actual endpoint/header probe | SDK cannot send mandatory local/provider authentication headers through its supported config; full SDK inference protection remains blocked. IDE/CLI subscription redirection is unverified |
+| [#65](https://github.com/mj10612/SecureMCP/issues/65) | Actual Antigravity CLI 1.3.0 stdio config, conflict/preservation/space-path tests, initialize/list/tools handshake; SDK 0.1.21 actual bilingual file reads through a context-owned authenticated xAI bridge, masked provider payloads and restored tools/answers | Explicit xAI API billing only; IDE/CLI subscription redirection remains unverified |
 
 See [compatibility](COMPATIBILITY.md), [Antigravity](ANTIGRAVITY.md), and
 [Grok/xAI](GROK.md) for setup and exact verification scope. These records describe
@@ -62,3 +62,37 @@ changes are documented in the English/Korean README rather than hidden behind ab
 
 Unrelated sponsorship/marketing proposal content was removed. Generated caches and coverage
 artifacts are excluded from the repository; the development environment remains available.
+
+
+## October 2026 gateway follow-up
+
+| Issues | Result | Regression evidence |
+| --- | --- | --- |
+| #68 | Empty/whitespace streamed tool argument fragments preserved | test_gateway_followups |
+| #69 | Per-provider state locks released across network waits; per-owner cached encryption derivation | test_gateway_runtime, test_snapshot_encryption |
+| #70 | Public statuses/codes preserved with sanitized context compaction hints; buffering limits documented | test_gateway_runtime, test_upstream_context_errors |
+| #71, #83 | Allocation bound configurable; authenticated idle-provider reset; crash-released OS locks | test_gateway_runtime, test_lock_recovery |
+| #72 | Contextual source detection; duplicate traversal cleanup; live-test flags documented | test_gateway_source |
+| #73 | Named JSON Schema dependencies share aliases; unsafe regex schemas rejected | test_gateway_followups |
+| #74, #79 | Typed controls and request envelopes validated before transformation | test_gateway_validation, test_gateway_followups |
+| #75, #76 | Retryable uninstall recovery journal and shared installation lock | test_install_recovery |
+| #77, #88 | Truncated health/shutdown response recovery | test_install_validation, test_install_recovery |
+| #80 | Contextual C/C++ directives preserved; header delimiters retained with private content masked | test_preprocessor |
+| #81 | Explicit multiword sensitive terms keep attached Korean particles and exact restoration | test_sensitive_particles |
+| #82 | Validated public query metadata forwarded; unsupported queries rejected | test_gateway_runtime, test_gateway_hosts |
+| #84, #89 | Uninstalled operations and malformed manifests handled before mutation | test_install_validation |
+| #86 | Lookahead design evaluated with measured baseline; buffering retained to preserve protocol/error contracts | docs/STREAMING.md, test_host_contract |
+| #85 | Authenticated bounded xAI model catalog with normalized public fields | test_gateway_catalog |
+
+C/C++ system and custom header **contents** are both masked; angle/quote delimiters and
+preprocessor syntax remain intact. Masked source is for model review and is not guaranteed
+to compile or resolve headers before restoration. Explicit sensitive-term suffix support
+uses the accepted particle vocabulary, not arbitrary Korean substring splitting.
+
+
+Local acceptance checks (Windows/Python 3.11.15): full warnings-as-errors suite,
+coverage gate 85%, Ruff and mypy; optional native offline Claude/Codex/Grok scenarios
+6 passed, actual Antigravity SDK 0.1.21 suite 15 passed/1 live skipped. Provider paid/live
+calls were not enabled. GitHub cross-platform results are reported separately in issue
+comments after pushing. The #86 design review retains buffering and includes measured
+performance/memory evidence; it does not claim incremental streaming was implemented.

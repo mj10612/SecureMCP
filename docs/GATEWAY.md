@@ -218,3 +218,53 @@ Claude의 기존 429는 식별 블록 처리 오류였고, 정상 요청의 거�
 스트리밍 전체를 모아 복원하므로 표시가 늦어질 수 있습니다. 서명·암호화된 추론은 가명 상태를
 유지합니다. 이미지·원격 첨부·미지원 요청은 차단합니다. 별도 도구 통신·텔레메트리는 보호 범위에
 포함되지 않으며, 문법·코드 구조·알고리즘이 남으므로 완전한 익명성을 보장하지 않습니다.
+
+
+## Recovery, concurrency, and supported constraints
+
+Alias transformation and encrypted snapshot writes are serialized per provider; waiting
+for the upstream network does not hold the alias lock or block another provider. Each
+provider keeps its own in-memory snapshot encryption context, deriving the key once;
+ordinary encrypted files still decrypt with the configured token. Expiry/reset/shutdown
+release that context. In-flight requests retain their alias table until restoration ends.
+
+The default mapping limit is 100,000. Set `mapping_limit` to a positive integer in the
+local gateway JSON configuration, or use `gateway run --mapping-limit 200000` for a
+foreground subscription daemon. The bound applies before allocating a new alias;
+existing aliases remain usable at the limit. To recover deliberately:
+
+```shell
+secure-mcp gateway reset --agent claude
+secure-mcp gateway reset --config /path/to/api-gateway.json --agent xai
+```
+
+Reset requires the local gateway token and refuses while the selected provider has
+active requests. It deletes that provider's encrypted snapshot and reasoning provenance.
+Start a new conversation afterwards: earlier conversation/tool arguments refer to the
+old alias table. Other providers retain their mappings. Reset does not modify login files.
+
+Native OS advisory locks release automatically after a process crash. Their marked
+`.lock` files intentionally persist; do not delete them while writers may be running.
+A legacy empty lock from the previous exclusive-create format is refused conservatively.
+Stop **all old writers**, then remove only the confirmed legacy empty lock and retry.
+Install/uninstall use the same configuration lock. An interrupted uninstall records
+recovery state; retry uninstall to finish, preserving unexpected user edits.
+
+JSON Schema named dependencies (`dependentRequired`, `dependentSchemas`, and legacy
+`dependencies`) share aliases with `properties`. Regex `pattern` and `patternProperties`
+constraints are rejected before forwarding because renaming private names cannot safely
+preserve arbitrary regex semantics. Replace them with explicit supported properties.
+Subscription controls and request envelopes are validated before private content is masked.
+
+Upstream 400/401/403/404/408/413/422/429/500/502/503/504/529 statuses are preserved.
+Only allowlisted public error types/codes are returned; provider messages, parameter names,
+and other diagnostic content are discarded. Context-length errors receive a fixed
+compaction hint. Unknown statuses and redirects become 502. Retry metadata remains bounded
+to the existing public response-header allowlist. SSE is fully buffered (16 MiB maximum);
+the 180-second socket timeout is a read timeout, **not a total request deadline**. These
+limits can reject large or slow streams; reset is not a substitute for context compaction.
+
+
+POST query metadata is forwarded without alteration after validation: `beta=true|false`,
+`client_version` with dotted numeric components, and date-shaped `api-version` are supported.
+Unknown, duplicate, or private query parameters are rejected before contacting the provider.

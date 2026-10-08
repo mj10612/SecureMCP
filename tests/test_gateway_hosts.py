@@ -44,10 +44,10 @@ class Provider(BaseHTTPRequestHandler):
                 )
                 if found:
                     alias = found
-        if self.path.endswith("count_tokens"):
+        if self.path.split("?", 1)[0].endswith("count_tokens"):
             events = None
             body = b'{"input_tokens":100}'
-        elif self.path.endswith("messages"):
+        elif self.path.split("?", 1)[0].endswith("messages"):
             item = {
                 "id": "msg_fixture",
                 "type": "message",
@@ -136,13 +136,13 @@ class Provider(BaseHTTPRequestHandler):
             and getattr(self.server, "tool_file", None)
             and len(self.server.requests) == 1
         ):
-            agent = "claude" if self.path.endswith("messages") else "codex"
+            agent = "claude" if self.path.split("?", 1)[0].endswith("messages") else "codex"
             mappings = self.server.gateway.sessions[
                 agent
             ].session.forward_store.values()
             names = {m.original: m.surrogate for m in mappings}
             filename = names["fixture"] + "." + names["py"]
-            if self.path.endswith("messages"):
+            if self.path.split("?", 1)[0].endswith("messages"):
                 arguments = json.dumps({"file_path": filename})
                 events = [
                     {"type": "message_start", "message": item},
@@ -278,9 +278,9 @@ def test_native_subscription_cli_gateway(
     monkeypatch.setattr(GatewayHandler, "send_body", record_send)
     original_request = GatewaySession.request
 
-    def record_request(session, payload):
+    def record_request(session, payload, **kwargs):
         try:
-            return original_request(session, payload)
+            return original_request(session, payload, **kwargs)
         except Exception as exc:
             statuses.append(("mask error", str(exc), list(payload)))
             raise

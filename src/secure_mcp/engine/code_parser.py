@@ -49,6 +49,10 @@ NUMBER = re.compile(
 )
 IDENTIFIER = re.compile(r"[^\W\d]\w*|_\w*", re.UNICODE)
 STRING_START = re.compile(r"[rRuUbBfF]{0,2}(\"\"\"|'''|\"|')")
+PREPROCESSOR_DIRECTIVES = {
+    "include", "include_next", "define", "undef", "if", "ifdef", "ifndef",
+    "elif", "elifdef", "elifndef", "else", "endif", "pragma", "error", "warning", "line",
+}
 
 
 def detect_language(code: str, language: str = "auto") -> str:
@@ -105,6 +109,10 @@ def quoted_end(code: str, start: int, quote: str, formatted: bool = False) -> in
 
 
 def literal_parts(value: str, subkind: str) -> tuple[str, str]:
+    if subkind == "header":
+        return "<", ">"
+    if subkind == "diagnostic":
+        return "", ""
     if subkind == "comment":
         prefix = next((p for p in ("//", "/*", "--", "#") if value.startswith(p)), "#")
         return prefix, "*/" if prefix == "/*" else ""
@@ -128,11 +136,18 @@ class CodeParser:
         language = detect_language(code, language)
         tokens: list[tuple[str, TokenType, str]] = []
         i = 0
+        directive = None
+        expect_header = expect_pragma = False
+        at_line_start = True
         while i < len(code):
             start = i
             c = code[i]
             kind = "syntax"
             token_type = TokenType.GRAMMAR
+            directive_match = (
+                re.match(r"#[ \t]*([A-Za-z_]\w*)", code[i:])
+                if language in {"c", "cpp"} and c == "#" and at_line_start else None
+            )
             comment = next(
                 (
                     p
@@ -153,6 +168,23 @@ class CodeParser:
                 while i < len(code) and code[i].isspace():
                     i += 1
                 kind = "whitespace"
+            elif directive_match and directive_match[1] in PREPROCESSOR_DIRECTIVES:
+                i += len(directive_match[0])
+                directive = directive_match[1]
+                expect_header = directive in {"include", "include_next"}
+                expect_pragma = directive == "pragma"
+                kind = "keyword"
+            elif directive in {"error", "warning"}:
+                end = code.find("\n", i)
+                i = end if end >= 0 else len(code)
+                token_type, kind = TokenType.LITERAL, "diagnostic"
+            elif expect_header and c == "<":
+                end = code.find(">", i + 1)
+                newline = code.find("\n", i + 1)
+                if end < 0 or (newline >= 0 and newline < end):
+                    raise ValueError("Unterminated include header")
+                i = end + 1
+                token_type, kind = TokenType.LITERAL, "header"
             elif comment:
                 if comment == "/*":
                     end = code.find("*/", i + 2)
@@ -209,6 +241,10 @@ class CodeParser:
                         if language == "sql"
                         else word in LANGUAGE_KEYWORDS[language]
                     )
+                    if directive in {"if", "elif"} and word == "defined":
+                        reserved = True
+                    if expect_pragma and word == "once":
+                        reserved = True
                     if language == "python" and word in {"match", "case"}:
                         line = code[code.rfind("\n", 0, start) + 1 :]
                         reserved = bool(re.match(r"\s*(?:match|case)\s+[^=\n]+:", line))
@@ -219,5 +255,21 @@ class CodeParser:
                     )
                 else:
                     i += 1
-            tokens.append((code[start:i], token_type, kind))
+            raw = code[start:i]
+            # Only whitespace/comments can precede a directive on a logical
+            # line. Preserve continuation context across escaped newlines.
+            for newline_match in re.finditer("\n", raw):
+                position = start + newline_match.start()
+                previous = position - 1
+                if previous >= 0 and code[previous] == "\r":
+                    previous -= 1
+                if previous < 0 or code[previous] != "\\":
+                    directive = None
+                    expect_header = expect_pragma = False
+                    at_line_start = True
+            if kind not in {"whitespace", "comment"}:
+                at_line_start = False
+                if not directive_match:
+                    expect_header = expect_pragma = False
+            tokens.append((raw, token_type, kind))
         return tokens

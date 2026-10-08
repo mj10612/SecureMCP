@@ -534,7 +534,8 @@ def gateway_ensure(config):
 
 @gateway.command("run")
 @click.option("--config", type=click.Path(path_type=Path))
-def gateway_run(config):
+@click.option("--mapping-limit", type=click.IntRange(1), default=None)
+def gateway_run(config, mapping_limit):
     """Run the subscription gateway in the foreground (normally auto-started)."""
     from secure_mcp.gateway import PrivacyGateway
     from secure_mcp.gateway_install import default_config, load_config
@@ -545,7 +546,10 @@ def gateway_run(config):
             raise ValueError("Use gateway api-run for API configuration.")
         state = (config or default_config()).resolve().parent / "sessions"
         with PrivacyGateway(
-            ("127.0.0.1", settings["port"]), settings["token"], state_dir=state
+            ("127.0.0.1", settings["port"]),
+            settings["token"],
+            state_dir=state,
+            mapping_limit=mapping_limit or settings.get("mapping_limit", 100_000),
         ) as server:
             server.serve_forever()
     except (ValueError, OSError) as exc:
@@ -559,10 +563,10 @@ def gateway_uninstall(config):
     from secure_mcp.gateway_install import default_config, uninstall_gateway
 
     try:
-        uninstall_gateway(config or default_config())
+        changed = uninstall_gateway(config or default_config())
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
-    click.echo("Previous agent settings restored. Restart the CLI.")
+    click.echo("Previous agent settings restored. Restart the CLI." if changed else "No active gateway installation found.")
 
 
 @gateway.command("status")
@@ -584,6 +588,40 @@ def gateway_status(config):
         raise click.exceptions.Exit(1)
 
 
+@gateway.command("reset")
+@click.option("--config", type=click.Path(path_type=Path))
+@click.option(
+    "--agent", type=click.Choice(["claude", "codex", "xai", "all"]), default="all"
+)
+def gateway_reset(config, agent):
+    """Clear idle provider mappings. Start a new conversation after reset."""
+    import urllib.request
+    from secure_mcp.gateway_install import default_config, load_config
+    from secure_mcp.gateway import NoRedirect
+
+    try:
+        settings = load_config(config or default_config())
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{settings['port']}/reset",
+            data=json.dumps({"agent": agent}).encode(),
+            headers={
+                "X-SecureMCP-Token": settings["token"],
+                "Content-Type": "application/json",
+            },
+        )
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect()
+        )
+        with opener.open(request, timeout=10) as response:
+            if response.status != 200:
+                raise ValueError("Reset was refused.")
+    except (ValueError, OSError):
+        raise click.ClickException(
+            "Reset failed; check configuration and wait for active requests to finish."
+        ) from None
+    click.echo("Mappings cleared. Start a new conversation before continuing.")
+
+
 @gateway.command("stop")
 @click.option("--config", type=click.Path(path_type=Path))
 def gateway_stop(config):
@@ -591,10 +629,10 @@ def gateway_stop(config):
     from secure_mcp.gateway_install import default_config, stop_gateway
 
     try:
-        stop_gateway(config or default_config())
+        changed = stop_gateway(config or default_config())
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
-    click.echo("Gateway stopped.")
+    click.echo("Gateway stopped." if changed else "No active gateway installation found.")
 
 
 @gateway.command("api-install")
@@ -634,6 +672,7 @@ def gateway_api_run(config):
             settings["token"],
             upstreams={},
             api_upstreams={"xai": API_UPSTREAMS["xai"]},
+            mapping_limit=settings.get("mapping_limit", 100_000),
             state_dir=path.resolve().parent / "sessions",
         ) as server:
             server.serve_forever()
@@ -649,12 +688,16 @@ def gateway_api_uninstall(config):
     from secure_mcp.xai_install import default_api_config, load_api_config
 
     path = config or default_api_config()
+    if not path.exists() and not (path.parent / "installation.json").exists():
+        click.echo("No active gateway installation found.")
+        return
     try:
-        load_api_config(path)
-        uninstall_gateway(path)
+        if path.exists():
+            load_api_config(path)
+        changed = uninstall_gateway(path)
     except (ValueError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
-    click.echo("Grok settings restored. API gateway stopped.")
+    click.echo("Grok settings restored. API gateway stopped." if changed else "No active gateway installation found.")
 
 
 if __name__ == "__main__":

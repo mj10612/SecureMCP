@@ -531,7 +531,9 @@ def test_cli_file_lock_covers_read_modify_write(tmp_path):
             env={"SECURE_MCP_SESSION_PASSWORD": "pw"},
         )
         assert result.exit_code != 0 and "in use" in result.output
-    assert not path.exists() and not path.with_name("s.enc.lock").exists()
+    assert not path.exists() and path.with_name("s.enc.lock").is_file()
+    with session_file_lock(path):
+        pass  # The persistent marker does not retain ownership after release.
 
 
 @pytest.mark.asyncio
