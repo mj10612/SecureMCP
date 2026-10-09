@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from threading import Event, RLock, Thread
+from threading import TIMEOUT_MAX, Event, RLock, Thread
 import time
 import uuid
 import weakref
@@ -99,9 +99,17 @@ class SessionVault:
         self._stop = Event()
         self._closed = False
         self._thread: Thread | None = None
-        self.cleanup_interval = cleanup_interval or min(1.0, default_ttl / 2)
-        if self.cleanup_interval <= 0:
-            raise ValueError("cleanup_interval must be positive")
+        self.cleanup_interval = (
+            min(1.0, default_ttl / 2) if cleanup_interval is None else cleanup_interval
+        )
+        if (
+            isinstance(self.cleanup_interval, bool)
+            or not math.isfinite(self.cleanup_interval)
+            or not 0 < self.cleanup_interval <= TIMEOUT_MAX
+        ):
+            raise ValueError(
+                "cleanup_interval must be finite, positive, and at most threading.TIMEOUT_MAX"
+            )
 
     def _sid(self, session_id: str | None) -> str:
         return (

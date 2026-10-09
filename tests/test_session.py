@@ -1,8 +1,34 @@
 """Tests for SessionVault and PrivacySession isolation and safety."""
 
 import time
+from threading import TIMEOUT_MAX
+
+import pytest
 from secure_mcp.session import SessionVault
 from secure_mcp.models import TokenType
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [0, -1, False, True, float("nan"), float("inf"), -float("inf"), TIMEOUT_MAX * 2],
+)
+def test_cleanup_interval_rejects_invalid_timeouts(interval):
+    with pytest.raises(ValueError, match="cleanup_interval"):
+        SessionVault(cleanup_interval=interval)
+
+
+@pytest.mark.parametrize(
+    "interval, expected",
+    [(None, 0.25), (0.01, 0.01), (TIMEOUT_MAX, TIMEOUT_MAX)],
+)
+def test_cleanup_interval_preserves_valid_timeouts(interval, expected):
+    vault = SessionVault(default_ttl=0.5, cleanup_interval=interval)
+    try:
+        assert vault.cleanup_interval == expected
+        vault.get_or_create("valid_interval")
+        assert vault._thread.is_alive()
+    finally:
+        vault.close()
 
 
 def test_session_creation_and_isolation():
